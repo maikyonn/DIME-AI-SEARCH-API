@@ -60,7 +60,7 @@ logs/
 # Database
 *.db
 *.sqlite3
-snap_data_lancedb/
+influencers_lancedb/
 
 # Temporary files
 tmp/

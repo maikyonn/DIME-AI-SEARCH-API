@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     
     # Database settings
     DB_PATH: Optional[str] = None
+    TABLE_NAME: str = "influencer_profiles"
     
     # API settings
     API_V1_PREFIX: str = "/api/v1"
@@ -46,4 +47,5 @@ settings = Settings()
 if not settings.DB_PATH:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(os.path.dirname(current_dir))
-    settings.DB_PATH = os.path.join(project_root, "snap_data_lancedb")
+    # Use the new vector database path
+    settings.DB_PATH = os.path.join(project_root, "DIME-AI-DB", "influencers_vectordb")

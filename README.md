@@ -51,7 +51,7 @@ fastapi_backend/
 ### Prerequisites
 
 - Python 3.8+
-- Access to the existing LanceDB database
+- Access to the existing LanceDB database (influencers_lancedb)
 - (Optional) Bright Data API token for image refresh functionality
 
 ### Installation
@@ -72,12 +72,11 @@ fastapi_backend/
 
 4. **Configure environment variables**
    ```bash
-   cp .env.example .env
-   # Edit .env with your configuration
+   # Edit .env file with your configuration (already created)
    ```
 
 5. **Ensure database access**
-   - The API expects the LanceDB database at `../snap_data_lancedb` relative to the project root
+   - The API expects the LanceDB database at `../influencers_lancedb` relative to the project root
    - Or set `DB_PATH` in your `.env` file to point to the correct location
 
 ### Configuration
@@ -88,8 +87,8 @@ Edit `.env` file with your settings:
 # Set to true for development
 DEBUG=true
 
-# Path to LanceDB database (optional - defaults to ../snap_data_lancedb)
-DB_PATH=/path/to/your/snap_data_lancedb
+# Path to LanceDB database (optional - defaults to ../influencers_lancedb)
+DB_PATH=/path/to/your/influencers_lancedb
 
 # Bright Data API token for image refresh (optional)
 BRIGHTDATA_API_TOKEN=your_token_here

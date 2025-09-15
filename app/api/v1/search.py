@@ -23,6 +23,11 @@ def format_number(num: int) -> str:
         return str(int(num))
 
 
+def format_engagement_rate(rate: float) -> float:
+    """Convert engagement rate from decimal to percentage (multiply by 100) with full precision"""
+    return rate * 100 if rate is not None else 0.0
+
+
 def parse_json_field(json_str: str) -> List[Any]:
     """Parse JSON fields and extract meaningful content"""
     if not json_str or json_str == '':
@@ -39,52 +44,41 @@ def parse_json_field(json_str: str) -> List[Any]:
         return []
 
 
-def _is_business_description(query: str) -> bool:
-    """Detect if a query is a business description rather than a search term"""
-    query_lower = query.lower()
-    
-    # Business description indicators
-    business_indicators = [
-        'we are', 'we\'re', 'our company', 'our business', 'my business', 'my company',
-        'i\'m', 'i am', 'startup', 'company', 'business', 'brand', 'we sell', 'we offer',
-        'our mission', 'our goal', 'we want to', 'we need', 'looking for', 'targeting'
-    ]
-    
-    # Check for business language
-    for indicator in business_indicators:
-        if indicator in query_lower:
-            return True
-    
-    # Check for sentence structure (longer descriptions with multiple clauses)
-    if len(query.split()) > 10 and any(word in query_lower for word in ['and', 'for', 'to', 'with']):
-        return True
-    
-    return False
-
-
 def result_to_dict(result) -> Dict[str, Any]:
-    """Convert SearchResult to dictionary for JSON serialization"""
+    """Convert SearchResult to dictionary for JSON serialization with original database column names"""
     return {
         'id': result.id,
         'account': result.account,
         'profile_name': result.profile_name,
         'followers': result.followers,
         'followers_formatted': format_number(result.followers),
-        'avg_engagement': result.avg_engagement,
+        'avg_engagement': format_engagement_rate(result.avg_engagement),
+        'avg_engagement_raw': result.avg_engagement,  # Keep raw value for advanced filtering
         'business_category_name': result.business_category_name,
         'business_address': result.business_address,
         'biography': result.biography,
         'profile_image_link': getattr(result, 'profile_image_link', ''),
+        'profile_url': getattr(result, 'profile_url', ''),
+        'business_email': getattr(result, 'business_email', ''),
+        'email_address': getattr(result, 'email_address', ''),
         'posts': parse_json_field(getattr(result, 'posts', '')),
-        'score': result.score,
-        'engagement_score': result.engagement_score,
-        'relevance_score': getattr(result, 'category_relevance_score', 0.0),
-        'genz_appeal_score': result.genz_appeal_score,
-        'authenticity_score': result.authenticity_score,
-        'campaign_value_score': result.campaign_value_score,
-        'category_relevance_score': getattr(result, 'category_relevance_score', 0.0),
-        'business_alignment_score': getattr(result, 'business_alignment_score', 0.0),
         'is_personal_creator': getattr(result, 'is_personal_creator', True),
+        # Original database LLM score columns
+        'individual_vs_org_score': getattr(result, 'individual_vs_org_score', 0),
+        'generational_appeal_score': getattr(result, 'generational_appeal_score', 0),
+        'professionalization_score': getattr(result, 'professionalization_score', 0),
+        'relationship_status_score': getattr(result, 'relationship_status_score', 0),
+        # Vector search similarity scores (text-based search)
+        'keyword_score': getattr(result, 'keyword_score', 0.0),
+        'profile_score': getattr(result, 'profile_score', 0.0),
+        'content_score': getattr(result, 'content_score', 0.0),
+        'combined_score': getattr(result, 'combined_score', 0.0),
+        # Vector similarity scores (direct vector comparison)
+        'keyword_similarity': getattr(result, 'keyword_similarity', 0.0),
+        'profile_similarity': getattr(result, 'profile_similarity', 0.0),
+        'content_similarity': getattr(result, 'content_similarity', 0.0),
+        'vector_similarity_score': getattr(result, 'vector_similarity_score', 0.0),
+        'similarity_explanation': getattr(result, 'similarity_explanation', ''),
     }
 
 
@@ -100,47 +94,48 @@ async def search_creators(
     It automatically detects the query type or you can specify it explicitly.
     """
     try:
-        # Convert custom weights if provided
+        # Prepare custom weights if provided
         custom_weights = None
-        if request.weights:
+        if request.custom_weights:
             custom_weights = {
-                'business_alignment': request.weights.business_alignment,
-                'genz_appeal': request.weights.genz_appeal,
-                'authenticity': request.weights.authenticity,
-                'engagement': request.weights.engagement,
-                'campaign_value': request.weights.campaign_value
+                'keyword': request.custom_weights.keyword,
+                'profile': request.custom_weights.profile,
+                'content': request.custom_weights.content
             }
         
-        # Determine if this is a business description or regular search
-        is_business_desc = request.is_business_description or _is_business_description(request.query)
-        
-        if is_business_desc:
-            # Use business matching
-            results = search_engine.match_creators_to_business(
-                business_description=request.query,
-                method=request.method,
-                limit=request.limit,
-                custom_weights=custom_weights,
-                min_followers=request.min_followers,
-                max_followers=request.max_followers,
-                min_engagement=request.min_engagement,
-                location_filter=request.location,
-                target_category=request.category
-            )
-        else:
-            # Use regular search
-            results = search_engine.search_creators_for_campaign(
-                query=request.query,
-                method=request.method,
-                limit=request.limit,
-                min_followers=request.min_followers,
-                max_followers=request.max_followers,
-                min_engagement=request.min_engagement,
-                location_filter=request.location,
-                target_category=request.category,
-                relevance_keywords=request.keywords,
-                custom_weights=custom_weights
-            )
+        # Use vector search with full customization
+        results = search_engine.search_creators_for_campaign(
+            query=request.query,
+            method=request.method,
+            limit=request.limit,
+            min_followers=request.min_followers,
+            max_followers=request.max_followers,
+            min_engagement=request.min_engagement,
+            max_engagement=request.max_engagement,
+            location_filter=request.location,
+            target_category=request.category,
+            relevance_keywords=request.keywords,
+            custom_weights=custom_weights,
+            similarity_threshold=request.similarity_threshold,
+            return_vectors=request.return_vectors,
+            # Account Type Filters
+            is_verified=request.is_verified,
+            is_business_account=request.is_business_account,
+            # LLM Score Filters
+            min_individual_vs_org_score=request.min_individual_vs_org_score,
+            max_individual_vs_org_score=request.max_individual_vs_org_score,
+            min_generational_appeal_score=request.min_generational_appeal_score,
+            max_generational_appeal_score=request.max_generational_appeal_score,
+            min_professionalization_score=request.min_professionalization_score,
+            max_professionalization_score=request.max_professionalization_score,
+            min_relationship_status_score=request.min_relationship_status_score,
+            max_relationship_status_score=request.max_relationship_status_score,
+            # Content Stats Filters
+            min_posts_count=request.min_posts_count,
+            max_posts_count=request.max_posts_count,
+            min_following=request.min_following,
+            max_following=request.max_following
+        )
         
         # Convert results to dictionaries
         results_data = [result_to_dict(result) for result in results]
@@ -172,10 +167,27 @@ async def find_similar_creators(
     and audience demographics to the specified reference account.
     """
     try:
+        # Prepare custom weights if provided
+        custom_weights = None
+        if request.custom_weights:
+            custom_weights = {
+                'keyword': request.custom_weights.keyword,
+                'profile': request.custom_weights.profile,
+                'content': request.custom_weights.content
+            }
+        
         results = search_engine.find_similar_creators(
             reference_account=request.account,
             limit=request.limit,
-            min_followers=request.min_followers
+            min_followers=request.min_followers,
+            max_followers=request.max_followers,
+            min_engagement=request.min_engagement,
+            max_engagement=request.max_engagement,
+            location_filter=request.location,
+            target_category=request.category,
+            similarity_threshold=request.similarity_threshold,
+            use_vector_similarity=request.use_vector_similarity,
+            custom_weights=custom_weights
         )
         
         results_data = [result_to_dict(result) for result in results]
@@ -210,8 +222,13 @@ async def search_by_category(
         results = search_engine.search_by_category(
             category=request.category,
             location=request.location,
+            limit=request.limit,
             min_followers=request.min_followers,
-            limit=request.limit
+            max_followers=request.max_followers,
+            min_engagement=request.min_engagement,
+            max_engagement=request.max_engagement,
+            custom_weights=custom_weights,
+            similarity_threshold=request.similarity_threshold
         )
         
         results_data = [result_to_dict(result) for result in results]

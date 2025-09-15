@@ -22,7 +22,7 @@ def init_search_engine() -> bool:
     try:
         from app.core.search_engine import FastAPISearchEngine
         
-        db_path = settings.DB_PATH or os.path.join(get_project_root(), "snap_data_lancedb")
+        db_path = settings.DB_PATH or os.path.join(get_project_root(), "DIME-AI-DB", "influencers_vectordb")
         
         if os.path.exists(db_path):
             _search_engine = FastAPISearchEngine(db_path)
