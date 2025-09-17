@@ -251,6 +251,44 @@ class FastAPISearchEngine:
             search_results.append(self._convert_to_search_result(row))
         
         return search_results
+
+    def get_creator_by_username(self, username: str) -> Optional[SearchResult]:
+        """Fetch a single creator profile by username."""
+        if not username:
+            return None
+
+        normalized = username.strip().lstrip('@')
+        if not normalized:
+            return None
+
+        # Escape single quotes to avoid query syntax issues
+        sanitized = normalized.replace("'", "''")
+
+        # Ensure the underlying table connection is available
+        self.engine.connect()
+        table = getattr(self.engine, 'table', None)
+        if table is None:
+            return None
+
+        # Try exact match first, then case-insensitive, then partial match
+        queries = [
+            f"account = '{sanitized}'",
+            f"LOWER(account) = '{sanitized.lower()}'",
+            f"LOWER(account) LIKE '%{sanitized.lower()}%'"
+        ]
+
+        for query in queries:
+            try:
+                results = table.search().where(query).to_pandas()
+            except Exception:
+                continue
+
+            if not results.empty:
+                # Prefer the exact match order by placing the most relevant row first
+                row = results.iloc[0]
+                return self._convert_to_search_result(row)
+
+        return None
     
     def match_creators_to_business(
         self,

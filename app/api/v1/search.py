@@ -82,6 +82,38 @@ def result_to_dict(result) -> Dict[str, Any]:
     }
 
 
+@router.get("/username/{username}")
+async def get_creator_by_username(
+    username: str,
+    search_engine=Depends(get_search_engine)
+):
+    """Retrieve a single creator profile by exact username."""
+    sanitized = username.strip()
+    if not sanitized:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    try:
+        result = search_engine.get_creator_by_username(sanitized)
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Creator '@{sanitized}' not found"
+            )
+
+        return {
+            'success': True,
+            'result': result_to_dict(result)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Username lookup failed: {str(e)}"
+        )
+
+
 @router.post("/", response_model=SearchResponse)
 async def search_creators(
     request: SearchRequest,
@@ -219,6 +251,14 @@ async def search_by_category(
     optionally filtered by location.
     """
     try:
+        custom_weights = None
+        if request.custom_weights:
+            custom_weights = {
+                'keyword': request.custom_weights.keyword,
+                'profile': request.custom_weights.profile,
+                'content': request.custom_weights.content
+            }
+
         results = search_engine.search_by_category(
             category=request.category,
             location=request.location,
