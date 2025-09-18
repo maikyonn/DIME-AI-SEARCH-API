@@ -303,6 +303,8 @@ class FastAPISearchEngine:
             "vector_results": json.loads(results_df.to_json(orient="records")),
             "brightdata_results": [],
             "profile_fit": [],
+            "vector_query": vector_query,
+            "business_query": business_query,
         }
 
         if business_fit_query:

@@ -2,6 +2,7 @@
 import json
 from typing import List, Dict, Any
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 
 from app.dependencies import get_search_engine
 from app.models.search import (
@@ -210,6 +211,200 @@ async def search_creators(
             status_code=500,
             detail=f"Search failed: {str(e)}"
         )
+
+
+@router.post("/stream")
+async def search_creators_stream(
+    request: SearchRequest,
+    search_engine=Depends(get_search_engine)
+):
+    """Stream stage-by-stage search progress using Server-Sent Events."""
+    vector_query = request.vector_query or request.query
+    business_query = request.business_query or request.business_fit_query
+
+    def event_stream():
+        import json
+        from app.core.search_engine import SearchWeights
+        from app.core.post_filter.profile_fit import ProfileFitAssessor
+        from app.core.post_filter.profile_fit import _parse_posts
+        from app.api.v1.search import result_to_dict
+        from app.config import settings
+
+        def sse_event(stage: str, payload: Dict[str, Any]) -> str:
+            return f"data: {json.dumps({'stage': stage, 'data': payload})}\n\n"
+
+        try:
+            enhanced_query = vector_query
+            if request.keywords:
+                enhanced_query += " " + " ".join(request.keywords)
+            if request.category and request.category in search_engine.content_categories:
+                category_keywords = " ".join(search_engine.content_categories[request.category][:5])
+                enhanced_query += " " + category_keywords
+
+            custom_weights = None
+            if request.custom_weights:
+                custom_weights = SearchWeights(
+                    keyword=request.custom_weights.keyword,
+                    profile=request.custom_weights.profile,
+                    content=request.custom_weights.content
+                )
+
+            weights = custom_weights
+            if weights is None and request.method in {"keyword", "profile", "content"}:
+                if request.method == "keyword":
+                    weights = SearchWeights(keyword=0.7, profile=0.2, content=0.1)
+                elif request.method == "profile":
+                    weights = SearchWeights(keyword=0.3, profile=0.6, content=0.1)
+                elif request.method == "content":
+                    weights = SearchWeights(keyword=0.2, profile=0.3, content=0.5)
+
+            filters: Dict[str, Any] = {}
+            if request.max_followers is not None:
+                filters['followers'] = (int(request.min_followers), int(request.max_followers))
+            elif request.min_followers > 0:
+                filters['followers'] = (int(request.min_followers), 100000000)
+
+            if request.min_engagement is not None or request.max_engagement is not None:
+                min_eng = float(request.min_engagement) if request.min_engagement is not None else 0.0
+                max_eng = float(request.max_engagement) if request.max_engagement is not None else 1.0
+                if min_eng > 0 or max_eng < 1.0:
+                    filters['engagement_rate'] = (min_eng, max_eng)
+
+            if request.is_verified is not None:
+                filters['is_verified'] = request.is_verified
+            if request.is_business_account is not None:
+                filters['is_business_account'] = request.is_business_account
+
+            # score filters
+            score_fields = [
+                ('individual_vs_org_score', request.min_individual_vs_org_score, request.max_individual_vs_org_score),
+                ('generational_appeal_score', request.min_generational_appeal_score, request.max_generational_appeal_score),
+                ('professionalization_score', request.min_professionalization_score, request.max_professionalization_score),
+                ('relationship_status_score', request.min_relationship_status_score, request.max_relationship_status_score),
+            ]
+            for field, min_val, max_val in score_fields:
+                if min_val is not None and max_val is not None:
+                    filters[field] = (int(min_val), int(max_val))
+                elif min_val is not None:
+                    filters[field] = (int(min_val), 10)
+                elif max_val is not None:
+                    filters[field] = (0, int(max_val))
+
+            if request.min_posts_count is not None or request.max_posts_count is not None:
+                min_posts = int(request.min_posts_count) if request.min_posts_count is not None else 0
+                max_posts = int(request.max_posts_count) if request.max_posts_count is not None else 100000
+                filters['posts_count'] = (min_posts, max_posts)
+
+            if request.min_following is not None or request.max_following is not None:
+                min_following = int(request.min_following) if request.min_following is not None else 0
+                max_following = int(request.max_following) if request.max_following is not None else 100000000
+                filters['following'] = (min_following, max_following)
+
+            results_df = search_engine.engine.search(
+                query=enhanced_query,
+                limit=request.limit,
+                weights=weights,
+                filters=filters if filters else None
+            )
+
+            search_results = [search_engine._convert_to_search_result(row) for _, row in results_df.iterrows()]
+
+            vector_payload = {
+                "query": vector_query,
+                "count": len(search_results),
+                "results": [result_to_dict(r) for r in search_results],
+            }
+            yield sse_event("vector_results", vector_payload)
+
+            debug_payload = {
+                "vector_results": json.loads(results_df.to_json(orient="records")),
+                "brightdata_results": [],
+                "profile_fit": [],
+                "vector_query": vector_query,
+                "business_query": business_query,
+            }
+
+            if business_query:
+                subset = search_results[: request.post_filter_limit or len(search_results)]
+                brightdata_records: List[Dict[str, Any]] = []
+
+                if request.post_filter_use_brightdata:
+                    yield sse_event("brightdata_started", {"count": len(subset)})
+                    try:
+                        brightdata_records = search_engine._refresh_profiles_with_brightdata(subset)
+                        debug_payload["brightdata_results"] = brightdata_records
+                        yield sse_event("brightdata_results", {"records": brightdata_records})
+                    except Exception as exc:  # pylint: disable=broad-except
+                        yield sse_event("brightdata_error", {"message": str(exc)})
+
+                assessor = ProfileFitAssessor(
+                    business_query=business_query,
+                    model=request.post_filter_model or "gpt-5-mini",
+                    verbosity=request.post_filter_verbosity or "medium",
+                    max_posts=request.post_filter_max_posts or 6,
+                    concurrency=1,
+                    openai_api_key=settings.OPENAI_API_KEY,
+                )
+
+                documents = []
+                for item in subset:
+                    doc = {
+                        "account": item.account,
+                        "profile_url": item.profile_url or (f"https://instagram.com/{item.account}" if item.account else None),
+                        "followers": item.followers,
+                        "biography": item.biography,
+                        "profile_name": item.profile_name,
+                        "business_category_name": item.business_category_name,
+                        "category_name": item.business_category_name,
+                        "is_verified": item.is_verified,
+                        "posts": item.posts_raw,
+                    }
+                    doc["parsed_posts"] = _parse_posts(doc.get("posts"), max_posts=assessor.max_posts)
+                    documents.append(doc)
+
+                total = len(documents)
+                yield sse_event("profile_fit_started", {"total": total})
+
+                profile_fit_debug = []
+                for idx, (item, doc) in enumerate(zip(subset, documents), start=1):
+                    fit_result = assessor._score_profile(doc)
+                    item.fit_score = fit_result.score
+                    item.fit_rationale = fit_result.rationale
+                    item.fit_error = fit_result.error
+                    item.fit_prompt = fit_result.prompt
+                    item.fit_raw_response = fit_result.raw_response
+
+                    result_dict = result_to_dict(item)
+                    event_payload = {
+                        "index": idx,
+                        "total": total,
+                        "result": result_dict,
+                    }
+                    yield sse_event("profile_fit_result", event_payload)
+
+                    profile_fit_debug.append(
+                        {
+                            "account": fit_result.account,
+                            "profile_url": fit_result.profile_url,
+                            "followers": fit_result.followers,
+                            "score": fit_result.score,
+                            "rationale": fit_result.rationale,
+                            "error": fit_result.error,
+                            "prompt": fit_result.prompt,
+                            "raw_response": fit_result.raw_response,
+                        }
+                    )
+
+                yield sse_event("profile_fit_completed", {"total": total})
+                debug_payload["profile_fit"] = profile_fit_debug
+
+            final_results = [result_to_dict(r) for r in search_results]
+            yield sse_event("done", {"results": final_results, "debug": debug_payload})
+
+        except Exception as exc:  # pylint: disable=broad-except
+            yield sse_event("error", {"message": str(exc)})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.post("/profile-fit/test")
