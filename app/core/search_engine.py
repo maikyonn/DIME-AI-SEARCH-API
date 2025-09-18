@@ -5,18 +5,24 @@ This module provides a clean interface to the new three-vector search functional
 import os
 import sys
 import pandas as pd
-from typing import List, Optional, Dict, Any
+import json
+from typing import List, Optional, Dict, Any, Tuple, Union
 from dataclasses import dataclass
 
 # Add the DIME-AI-DB src directory to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
-dime_db_src = os.path.join(project_root, "DIME-AI-DB", "src")
-sys.path.insert(0, dime_db_src)
+dime_db_root = os.path.join(project_root, "DIME-AI-DB")
+dime_db_src = os.path.join(dime_db_root, "src")
+
+for path in (dime_db_root, dime_db_src):
+    if path not in sys.path and os.path.isdir(path):
+        sys.path.insert(0, path)
 
 # Import from the new vector search engine
 from search.vector_search import VectorSearchEngine, SearchWeights
 from app.core.post_filter import BrightDataClient, ProfileFitAssessor, ProfileFitResult
+from app.config import settings
 
 @dataclass
 class SearchResult:
@@ -53,6 +59,8 @@ class SearchResult:
     fit_score: Optional[int] = None
     fit_rationale: Optional[str] = None
     fit_error: Optional[str] = None
+    fit_prompt: Optional[str] = None
+    fit_raw_response: Optional[str] = None
 
 
 class FastAPISearchEngine:
@@ -145,7 +153,9 @@ class FastAPISearchEngine:
             similarity_explanation=str(row.get('similarity_explanation', '')),
             fit_score=None,
             fit_rationale=None,
-            fit_error=None
+            fit_error=None,
+            fit_prompt=None,
+            fit_raw_response=None
         )
         
     def search_creators_for_campaign(
@@ -170,6 +180,7 @@ class FastAPISearchEngine:
         post_filter_model: str = "gpt-5-mini",
         post_filter_verbosity: str = "medium",
         post_filter_use_brightdata: bool = False,
+        return_debug: bool = False,
         # Account Type Filters
         is_verified: Optional[bool] = None,
         is_business_account: Optional[bool] = None,
@@ -187,7 +198,7 @@ class FastAPISearchEngine:
         max_posts_count: Optional[int] = None,
         min_following: Optional[int] = None,
         max_following: Optional[int] = None
-    ) -> List[SearchResult]:
+    ) -> Union[List[SearchResult], Tuple[List[SearchResult], Dict[str, Any]]]:
         """Search creators for a campaign using vector search"""
         
         # Build enhanced query with keywords
@@ -284,14 +295,20 @@ class FastAPISearchEngine:
         )
         
         # Convert to SearchResult objects
-        search_results = []
+        search_results: List[SearchResult] = []
         for _, row in results_df.iterrows():
             search_results.append(self._convert_to_search_result(row))
+
+        debug_payload: Dict[str, Any] = {
+            "vector_results": json.loads(results_df.to_json(orient="records")),
+            "brightdata_results": [],
+            "profile_fit": [],
+        }
 
         if business_fit_query:
             fit_limit = post_filter_limit or len(search_results)
             try:
-                search_results = self._apply_profile_fit(
+                search_results, fit_debug = self._apply_profile_fit(
                     search_results,
                     business_fit_query=business_fit_query,
                     limit=fit_limit,
@@ -301,8 +318,13 @@ class FastAPISearchEngine:
                     verbosity=post_filter_verbosity,
                     use_brightdata=post_filter_use_brightdata,
                 )
+                debug_payload.update(fit_debug)
             except Exception as exc:  # pylint: disable=broad-except
                 print(f'[WARN] Post-filter stage failed: {exc}')
+                debug_payload["post_filter_error"] = str(exc)
+
+        if return_debug:
+            return search_results, debug_payload
 
         return search_results
 
@@ -317,18 +339,19 @@ class FastAPISearchEngine:
         model: str,
         verbosity: str,
         use_brightdata: bool,
-    ) -> List[SearchResult]:
+    ) -> Tuple[List[SearchResult], Dict[str, Any]]:
         """Run stage-two LLM scoring and re-rank results."""
         if not results:
-            return results
+            return results, {"brightdata_results": [], "profile_fit": []}
 
         limit = max(1, min(limit, len(results))) if limit else len(results)
         subset = results[:limit]
         remainder = results[limit:] if limit < len(results) else []
 
+        brightdata_records: List[Dict[str, Any]] = []
         if use_brightdata:
             try:
-                self._refresh_profiles_with_brightdata(subset)
+                brightdata_records = self._refresh_profiles_with_brightdata(subset)
             except Exception as exc:  # pylint: disable=broad-except
                 print(f'[WARN] BrightData refresh failed: {exc}')
 
@@ -354,16 +377,31 @@ class FastAPISearchEngine:
             verbosity=verbosity,
             max_posts=max_posts,
             concurrency=concurrency,
+            openai_api_key=settings.OPENAI_API_KEY,
         )
 
         fit_results = assessor.score_profiles(documents)
         fit_map: Dict[str, ProfileFitResult] = {}
+        profile_fit_debug: List[Dict[str, Any]] = []
         for fit in fit_results:
             key = (fit.account or '').lower() if fit.account else None
             if key:
                 fit_map[key] = fit
             elif fit.profile_url:
                 fit_map[fit.profile_url.lower()] = fit
+
+            profile_fit_debug.append(
+                {
+                    "account": fit.account,
+                    "profile_url": fit.profile_url,
+                    "followers": fit.followers,
+                    "score": fit.score,
+                    "rationale": fit.rationale,
+                    "error": fit.error,
+                    "prompt": fit.prompt,
+                    "raw_response": fit.raw_response,
+                }
+            )
 
         for item in subset:
             fit: Optional[ProfileFitResult] = None
@@ -377,10 +415,14 @@ class FastAPISearchEngine:
                 item.fit_score = fit.score
                 item.fit_rationale = fit.rationale
                 item.fit_error = fit.error
+                item.fit_prompt = fit.prompt
+                item.fit_raw_response = fit.raw_response
             else:
                 item.fit_score = None
                 item.fit_rationale = None
                 item.fit_error = None
+                item.fit_prompt = None
+                item.fit_raw_response = None
 
         scored_subset = sorted(
             subset,
@@ -388,9 +430,14 @@ class FastAPISearchEngine:
             reverse=True,
         )
 
-        return scored_subset + remainder
+        debug_payload = {
+            "brightdata_results": brightdata_records,
+            "profile_fit": profile_fit_debug,
+        }
 
-    def _refresh_profiles_with_brightdata(self, profiles: List[SearchResult]) -> None:
+        return scored_subset + remainder, debug_payload
+
+    def _refresh_profiles_with_brightdata(self, profiles: List[SearchResult]) -> List[Dict[str, Any]]:
         """Fetch latest profile data from BrightData and update in-place."""
         urls: List[str] = []
         for item in profiles:
@@ -399,10 +446,11 @@ class FastAPISearchEngine:
                 urls.append(url)
 
         if not urls:
-            return
+            return []
 
         client = BrightDataClient()
         dataframe = client.fetch_profiles(urls)
+        records = json.loads(dataframe.to_json(orient="records")) if not dataframe.empty else []
         profile_map = BrightDataClient.dataframe_to_profile_map(dataframe)
 
         for item in profiles:
@@ -436,6 +484,8 @@ class FastAPISearchEngine:
             posts_value = match.get('posts') or match.get('posts_json')
             if posts_value:
                 item.posts_raw = posts_value
+
+        return records
 
     def run_profile_fit_preview(
         self,
@@ -476,6 +526,7 @@ class FastAPISearchEngine:
             verbosity=verbosity,
             max_posts=max_posts,
             concurrency=max(1, concurrency),
+            openai_api_key=settings.OPENAI_API_KEY,
         )
 
         documents = [

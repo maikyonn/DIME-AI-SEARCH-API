@@ -24,18 +24,23 @@ class BrightDataClient:
     BASE_URL = "https://api.brightdata.com/datasets/v3"
 
     def __init__(self, config: Optional[BrightDataConfig] = None) -> None:
-        api_key = os.getenv("BRIGHTDATA_API_KEY") if config is None else config.api_key
-        dataset_id = os.getenv("BRIGHTDATA_DATASET_ID") if config is None else config.dataset_id
+        if config is not None:
+            api_key = config.api_key
+            dataset_id = config.dataset_id
+            poll_interval = config.poll_interval
+        else:
+            from app.config import settings  # local import to avoid circulars
+            api_key = settings.BRIGHTDATA_API_KEY or os.getenv("BRIGHTDATA_API_KEY")
+            dataset_id = settings.BRIGHTDATA_DATASET_ID or os.getenv("BRIGHTDATA_DATASET_ID")
+            poll_interval = settings.BRIGHTDATA_POLL_INTERVAL or int(os.getenv("BRIGHTDATA_POLL_INTERVAL", "30"))
 
         if not api_key or not dataset_id:
             raise RuntimeError(
                 "BrightData configuration missing. Set BRIGHTDATA_API_KEY and BRIGHTDATA_DATASET_ID."
             )
 
-        poll_interval = config.poll_interval if config else int(os.getenv("BRIGHTDATA_POLL_INTERVAL", "30"))
-
         self.config = BrightDataConfig(api_key=api_key, dataset_id=dataset_id, poll_interval=poll_interval)
-        self.base_url = os.getenv("BRIGHTDATA_BASE_URL", self.BASE_URL)
+        self.base_url = settings.BRIGHTDATA_BASE_URL or os.getenv("BRIGHTDATA_BASE_URL", self.BASE_URL)
         self.headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",

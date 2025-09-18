@@ -86,6 +86,8 @@ def result_to_dict(result) -> Dict[str, Any]:
         'fit_score': getattr(result, 'fit_score', None),
         'fit_rationale': getattr(result, 'fit_rationale', None),
         'fit_error': getattr(result, 'fit_error', None),
+        'fit_prompt': getattr(result, 'fit_prompt', None),
+        'fit_raw_response': getattr(result, 'fit_raw_response', None),
     }
 
 
@@ -141,10 +143,13 @@ async def search_creators(
                 'profile': request.custom_weights.profile,
                 'content': request.custom_weights.content
             }
-        
+
+        vector_query = request.vector_query or request.query
+        business_query = request.business_query or request.business_fit_query
+
         # Use vector search with full customization
-        results = search_engine.search_creators_for_campaign(
-            query=request.query,
+        results, debug_payload = search_engine.search_creators_for_campaign(
+            query=vector_query,
             method=request.method,
             limit=request.limit,
             min_followers=request.min_followers,
@@ -157,13 +162,14 @@ async def search_creators(
             custom_weights=custom_weights,
             similarity_threshold=request.similarity_threshold,
             return_vectors=request.return_vectors,
-            business_fit_query=request.business_fit_query,
+            business_fit_query=business_query,
             post_filter_limit=request.post_filter_limit,
             post_filter_concurrency=request.post_filter_concurrency or 8,
             post_filter_max_posts=request.post_filter_max_posts or 6,
             post_filter_model=request.post_filter_model or "gpt-5-mini",
             post_filter_verbosity=request.post_filter_verbosity or "medium",
             post_filter_use_brightdata=request.post_filter_use_brightdata or False,
+            return_debug=True,
             # Account Type Filters
             is_verified=request.is_verified,
             is_business_account=request.is_business_account,
@@ -186,12 +192,17 @@ async def search_creators(
         # Convert results to dictionaries
         results_data = [result_to_dict(result) for result in results]
         
+        debug_payload['vector_query'] = vector_query
+        debug_payload['business_query'] = business_query
+
         return SearchResponse(
             success=True,
             results=results_data,
             count=len(results_data),
-            query=request.query,
-            method=request.method
+            query=vector_query,
+            business_query=business_query,
+            method=request.method,
+            debug=debug_payload
         )
         
     except Exception as e:
@@ -231,6 +242,8 @@ async def profile_fit_test(
                 'score': result.score,
                 'rationale': result.rationale,
                 'error': result.error,
+                'prompt': result.prompt,
+                'raw_response': result.raw_response,
             }
         }
 

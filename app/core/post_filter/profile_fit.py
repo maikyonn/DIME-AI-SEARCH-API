@@ -9,6 +9,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from openai import OpenAI
 
+from app.config import settings
+
 
 @dataclass
 class ProfileFitResult:
@@ -20,6 +22,8 @@ class ProfileFitResult:
     score: Optional[int]
     rationale: str
     error: Optional[str] = None
+    prompt: Optional[str] = None
+    raw_response: Optional[str] = None
 
 
 def _truncate(text: Optional[str], max_len: int = 240) -> str:
@@ -95,6 +99,7 @@ class ProfileFitAssessor:
         verbosity: str = "medium",
         max_posts: int = 6,
         concurrency: int = 8,
+        openai_api_key: Optional[str] = None,
     ) -> None:
         if not business_query:
             raise ValueError("business_query must be provided for profile fit assessment")
@@ -104,13 +109,14 @@ class ProfileFitAssessor:
         self.verbosity = verbosity
         self.max_posts = max_posts
         self.concurrency = max(1, concurrency)
+        self.api_key = openai_api_key or settings.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
 
-        if not os.getenv("OPENAI_API_KEY"):
+        if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY must be set to run profile fit post-filtering")
 
     # The OpenAI client is lightweight; create per call to avoid cross-thread issues
     def _call_openai(self, prompt: str) -> str:
-        client = OpenAI()
+        client = OpenAI(api_key=self.api_key)
         response = client.responses.create(
             model=self.model,
             input=[{"role": "user", "content": prompt}],
@@ -206,6 +212,8 @@ class ProfileFitAssessor:
                     followers=profile.get("followers"),
                     score=score,
                     rationale=rationale,
+                    prompt=prompt,
+                    raw_response=text,
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 attempts += 1
@@ -218,6 +226,8 @@ class ProfileFitAssessor:
             score=None,
             rationale=f"error: {last_error}",
             error=last_error,
+            prompt=prompt,
+            raw_response=None,
         )
 
     def score_profiles(self, profiles: Iterable[Dict[str, Any]]) -> List[ProfileFitResult]:

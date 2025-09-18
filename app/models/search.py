@@ -13,6 +13,8 @@ class CustomWeights(BaseModel):
 class SearchRequest(BaseModel):
     """Main search request model with maximum customizability"""
     query: str = Field(..., min_length=1, description="Search query for creators")
+    vector_query: Optional[str] = Field(default=None, description="Override for the vector search query")
+    business_query: Optional[str] = Field(default=None, description="Business brief for stage-two LLM scoring")
     method: str = Field(default="hybrid", description="Search method: vector, text, or hybrid")
     limit: int = Field(default=20, ge=1, description="Maximum number of results (no upper limit)")
     
@@ -110,7 +112,9 @@ class SearchResponse(BaseModel):
     results: List[Dict[str, Any]]
     count: int
     query: str
+    business_query: Optional[str] = None
     method: str
+    debug: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
 

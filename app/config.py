@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     
     # Image refresh settings
     BRIGHTDATA_API_TOKEN: Optional[str] = None
+    BRIGHTDATA_API_KEY: Optional[str] = None
+    BRIGHTDATA_DATASET_ID: Optional[str] = None
+    BRIGHTDATA_BASE_URL: Optional[str] = "https://api.brightdata.com/datasets/v3"
+    BRIGHTDATA_POLL_INTERVAL: int = 30
+
+    # OpenAI / LLM settings
+    OPENAI_API_KEY: Optional[str] = None
     
     # CORS settings
     ALLOWED_ORIGINS: Union[str, List[str]] = ["*"]

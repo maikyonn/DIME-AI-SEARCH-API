@@ -8,6 +8,7 @@ from app.config import settings
 # Global instances
 _search_engine = None
 _image_refresh_service = None
+_post_filter_ready = False
 
 
 def get_project_root():
@@ -18,7 +19,7 @@ def get_project_root():
 
 def init_search_engine() -> bool:
     """Initialize the search engine"""
-    global _search_engine
+    global _search_engine, _post_filter_ready
     try:
         from app.core.search_engine import FastAPISearchEngine
         
@@ -26,6 +27,9 @@ def init_search_engine() -> bool:
         
         if os.path.exists(db_path):
             _search_engine = FastAPISearchEngine(db_path)
+            print("✅ Search engine initialized")
+            print("   • DB path: {db_path}")
+            _post_filter_ready = True
             return True
         else:
             print(f"Database not found at: {db_path}")
@@ -33,6 +37,14 @@ def init_search_engine() -> bool:
     except Exception as e:
         print(f"Error initializing search engine: {e}")
         return False
+
+
+def init_post_filter() -> None:
+    from app.config import settings
+    if settings.OPENAI_API_KEY and settings.BRIGHTDATA_API_KEY and settings.BRIGHTDATA_DATASET_ID:
+        print("✅ Post-filter pipeline ready (LLM + BrightData)")
+    else:
+        print("⚠️ Post-filter pipeline missing OPENAI_API_KEY or BrightData settings; stage two will be limited")
 
 
 def init_image_refresh_service() -> bool:
