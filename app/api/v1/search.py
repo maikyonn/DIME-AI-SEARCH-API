@@ -5,7 +5,11 @@ from fastapi import APIRouter, HTTPException, Depends
 
 from app.dependencies import get_search_engine
 from app.models.search import (
-    SearchRequest, SimilarSearchRequest, CategorySearchRequest, SearchResponse
+    SearchRequest,
+    SimilarSearchRequest,
+    CategorySearchRequest,
+    SearchResponse,
+    ProfileFitTestRequest,
 )
 from app.models.creator import SearchResult
 
@@ -79,6 +83,9 @@ def result_to_dict(result) -> Dict[str, Any]:
         'content_similarity': getattr(result, 'content_similarity', 0.0),
         'vector_similarity_score': getattr(result, 'vector_similarity_score', 0.0),
         'similarity_explanation': getattr(result, 'similarity_explanation', ''),
+        'fit_score': getattr(result, 'fit_score', None),
+        'fit_rationale': getattr(result, 'fit_rationale', None),
+        'fit_error': getattr(result, 'fit_error', None),
     }
 
 
@@ -150,6 +157,13 @@ async def search_creators(
             custom_weights=custom_weights,
             similarity_threshold=request.similarity_threshold,
             return_vectors=request.return_vectors,
+            business_fit_query=request.business_fit_query,
+            post_filter_limit=request.post_filter_limit,
+            post_filter_concurrency=request.post_filter_concurrency or 8,
+            post_filter_max_posts=request.post_filter_max_posts or 6,
+            post_filter_model=request.post_filter_model or "gpt-5-mini",
+            post_filter_verbosity=request.post_filter_verbosity or "medium",
+            post_filter_use_brightdata=request.post_filter_use_brightdata or False,
             # Account Type Filters
             is_verified=request.is_verified,
             is_business_account=request.is_business_account,
@@ -185,6 +199,45 @@ async def search_creators(
             status_code=500,
             detail=f"Search failed: {str(e)}"
         )
+
+
+@router.post("/profile-fit/test")
+async def profile_fit_test(
+    request: ProfileFitTestRequest,
+    search_engine=Depends(get_search_engine)
+):
+    """Run stage-two profile fit scoring on a single influencer."""
+    if not request.account and not request.profile_url:
+        raise HTTPException(status_code=400, detail="Either account or profile_url must be provided")
+
+    try:
+        result = search_engine.run_profile_fit_preview(
+            business_fit_query=request.business_fit_query,
+            account=request.account,
+            profile_url=request.profile_url,
+            max_posts=request.max_posts,
+            model=request.model,
+            verbosity=request.verbosity,
+            use_brightdata=request.use_brightdata,
+            concurrency=request.concurrency,
+        )
+
+        return {
+            'success': True,
+            'result': {
+                'account': result.account,
+                'profile_url': result.profile_url,
+                'followers': result.followers,
+                'score': result.score,
+                'rationale': result.rationale,
+                'error': result.error,
+            }
+        }
+
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=500, detail=f"Profile fit test failed: {exc}") from exc
 
 
 @router.post("/similar", response_model=SearchResponse)

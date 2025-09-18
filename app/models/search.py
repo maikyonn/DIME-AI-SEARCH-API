@@ -29,6 +29,15 @@ class SearchRequest(BaseModel):
     category: Optional[str] = Field(default=None, description="Business category filter")
     keywords: Optional[List[str]] = Field(default=None, description="Additional keywords")
     
+    # Post-filtering controls
+    business_fit_query: Optional[str] = Field(default=None, description="Optional business brief for LLM-based post filtering")
+    post_filter_limit: Optional[int] = Field(default=None, ge=1, description="Number of top results to re-score")
+    post_filter_concurrency: Optional[int] = Field(default=8, ge=1, description="Concurrent LLM requests for post-filtering")
+    post_filter_max_posts: Optional[int] = Field(default=6, ge=1, description="Recent posts per profile to include in prompt")
+    post_filter_model: Optional[str] = Field(default="gpt-5-mini", description="OpenAI model for profile fit scoring")
+    post_filter_verbosity: Optional[str] = Field(default="medium", description="Responses API verbosity")
+    post_filter_use_brightdata: Optional[bool] = Field(default=False, description="Refresh top results via BrightData before scoring (blocking)")
+    
     # Advanced Search Controls
     custom_weights: Optional[CustomWeights] = Field(default=None, description="Custom vector search weights")
     similarity_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Minimum similarity threshold")
@@ -115,3 +124,16 @@ class ImageRefreshSearchRequest(BaseModel):
     """Image refresh for search results request"""
     search_results: List[Dict[str, Any]] = Field(..., min_items=1, description="Search results to refresh images for")
     update_database: bool = Field(default=True, description="Whether to update database with fresh data")
+
+
+class ProfileFitTestRequest(BaseModel):
+    """Request payload to score a single profile against a business brief."""
+
+    business_fit_query: str = Field(..., description="Business goals and desired creator traits")
+    account: Optional[str] = Field(default=None, description="Existing username to pull from LanceDB")
+    profile_url: Optional[str] = Field(default=None, description="Profile URL (used if account unavailable)")
+    max_posts: int = Field(default=6, ge=1, le=20, description="Maximum recent posts to include")
+    model: str = Field(default="gpt-5-mini", description="OpenAI model for scoring")
+    verbosity: str = Field(default="medium", description="Responses API verbosity mode")
+    use_brightdata: bool = Field(default=False, description="Refresh profile data via BrightData before scoring")
+    concurrency: int = Field(default=2, ge=1, le=8, description="Concurrent calls (use >1 when use_brightdata is false)")

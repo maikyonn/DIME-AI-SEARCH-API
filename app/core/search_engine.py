@@ -16,6 +16,7 @@ sys.path.insert(0, dime_db_src)
 
 # Import from the new vector search engine
 from search.vector_search import VectorSearchEngine, SearchWeights
+from app.core.post_filter import BrightDataClient, ProfileFitAssessor, ProfileFitResult
 
 @dataclass
 class SearchResult:
@@ -29,7 +30,10 @@ class SearchResult:
     business_address: str
     biography: str
     profile_image_link: str = ""
+    profile_url: Optional[str] = None
     is_personal_creator: bool = True
+    is_verified: Optional[bool] = None
+    posts_raw: Optional[str] = None
     # Original database LLM score columns
     individual_vs_org_score: int = 0
     generational_appeal_score: int = 0
@@ -46,6 +50,9 @@ class SearchResult:
     content_similarity: float = 0.0
     vector_similarity_score: float = 0.0
     similarity_explanation: str = ""
+    fit_score: Optional[int] = None
+    fit_rationale: Optional[str] = None
+    fit_error: Optional[str] = None
 
 
 class FastAPISearchEngine:
@@ -88,6 +95,24 @@ class FastAPISearchEngine:
             except (ValueError, TypeError):
                 return default
         
+        def safe_str(value):
+            if value is None:
+                return None
+            text_value = str(value)
+            return text_value if text_value.lower() != 'nan' else None
+
+        def safe_bool(value):
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return None
+            text_value = str(value).strip().lower()
+            if text_value in {'true', '1', 'yes', 'y'}:
+                return True
+            if text_value in {'false', '0', 'no', 'n'}:
+                return False
+            return None
+
         return SearchResult(
             id=safe_int(row.get('id', row.get('lance_db_id', 0))),
             account=str(row.get('account', '')),
@@ -98,7 +123,10 @@ class FastAPISearchEngine:
             business_address=str(row.get('business_address', '')),
             biography=str(row.get('biography', '')),
             profile_image_link=str(row.get('profile_image_link', '')),
+            profile_url=safe_str(row.get('profile_url') or row.get('url')),
             is_personal_creator=bool(safe_int(row.get('individual_vs_org_score', 5)) < 5),
+            is_verified=safe_bool(row.get('is_verified')),
+            posts_raw=safe_str(row.get('posts')),
             # Original database LLM score columns (keep as integers)
             individual_vs_org_score=safe_int(row.get('individual_vs_org_score', 0)),
             generational_appeal_score=safe_int(row.get('generational_appeal_score', 0)),
@@ -114,7 +142,10 @@ class FastAPISearchEngine:
             profile_similarity=safe_float(row.get('profile_similarity', 0.0)),
             content_similarity=safe_float(row.get('content_similarity', 0.0)),
             vector_similarity_score=safe_float(row.get('vector_similarity_score', 0.0)),
-            similarity_explanation=str(row.get('similarity_explanation', ''))
+            similarity_explanation=str(row.get('similarity_explanation', '')),
+            fit_score=None,
+            fit_rationale=None,
+            fit_error=None
         )
         
     def search_creators_for_campaign(
@@ -132,6 +163,13 @@ class FastAPISearchEngine:
         custom_weights: Optional[Dict[str, float]] = None,
         similarity_threshold: Optional[float] = None,
         return_vectors: bool = False,
+        business_fit_query: Optional[str] = None,
+        post_filter_limit: Optional[int] = None,
+        post_filter_concurrency: int = 8,
+        post_filter_max_posts: int = 6,
+        post_filter_model: str = "gpt-5-mini",
+        post_filter_verbosity: str = "medium",
+        post_filter_use_brightdata: bool = False,
         # Account Type Filters
         is_verified: Optional[bool] = None,
         is_business_account: Optional[bool] = None,
@@ -249,8 +287,247 @@ class FastAPISearchEngine:
         search_results = []
         for _, row in results_df.iterrows():
             search_results.append(self._convert_to_search_result(row))
-        
+
+        if business_fit_query:
+            fit_limit = post_filter_limit or len(search_results)
+            try:
+                search_results = self._apply_profile_fit(
+                    search_results,
+                    business_fit_query=business_fit_query,
+                    limit=fit_limit,
+                    concurrency=post_filter_concurrency,
+                    max_posts=post_filter_max_posts,
+                    model=post_filter_model,
+                    verbosity=post_filter_verbosity,
+                    use_brightdata=post_filter_use_brightdata,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f'[WARN] Post-filter stage failed: {exc}')
+
         return search_results
+
+    def _apply_profile_fit(
+        self,
+        results: List[SearchResult],
+        *,
+        business_fit_query: str,
+        limit: int,
+        concurrency: int,
+        max_posts: int,
+        model: str,
+        verbosity: str,
+        use_brightdata: bool,
+    ) -> List[SearchResult]:
+        """Run stage-two LLM scoring and re-rank results."""
+        if not results:
+            return results
+
+        limit = max(1, min(limit, len(results))) if limit else len(results)
+        subset = results[:limit]
+        remainder = results[limit:] if limit < len(results) else []
+
+        if use_brightdata:
+            try:
+                self._refresh_profiles_with_brightdata(subset)
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f'[WARN] BrightData refresh failed: {exc}')
+
+        documents = []
+        for item in subset:
+            documents.append(
+                {
+                    "account": item.account,
+                    "profile_url": item.profile_url or (f"https://instagram.com/{item.account}" if item.account else None),
+                    "followers": item.followers,
+                    "biography": item.biography,
+                    "profile_name": item.profile_name,
+                    "business_category_name": item.business_category_name,
+                    "category_name": item.business_category_name,
+                    "is_verified": getattr(item, 'is_verified', None),
+                    "posts": item.posts_raw,
+                }
+            )
+
+        assessor = ProfileFitAssessor(
+            business_query=business_fit_query,
+            model=model,
+            verbosity=verbosity,
+            max_posts=max_posts,
+            concurrency=concurrency,
+        )
+
+        fit_results = assessor.score_profiles(documents)
+        fit_map: Dict[str, ProfileFitResult] = {}
+        for fit in fit_results:
+            key = (fit.account or '').lower() if fit.account else None
+            if key:
+                fit_map[key] = fit
+            elif fit.profile_url:
+                fit_map[fit.profile_url.lower()] = fit
+
+        for item in subset:
+            fit: Optional[ProfileFitResult] = None
+            account_key = item.account.lower() if item.account else None
+            if account_key and account_key in fit_map:
+                fit = fit_map[account_key]
+            elif item.profile_url and item.profile_url.lower() in fit_map:
+                fit = fit_map[item.profile_url.lower()]
+
+            if fit:
+                item.fit_score = fit.score
+                item.fit_rationale = fit.rationale
+                item.fit_error = fit.error
+            else:
+                item.fit_score = None
+                item.fit_rationale = None
+                item.fit_error = None
+
+        scored_subset = sorted(
+            subset,
+            key=lambda r: ((r.fit_score or 0), r.combined_score),
+            reverse=True,
+        )
+
+        return scored_subset + remainder
+
+    def _refresh_profiles_with_brightdata(self, profiles: List[SearchResult]) -> None:
+        """Fetch latest profile data from BrightData and update in-place."""
+        urls: List[str] = []
+        for item in profiles:
+            url = item.profile_url or (f"https://instagram.com/{item.account}" if item.account else None)
+            if url:
+                urls.append(url)
+
+        if not urls:
+            return
+
+        client = BrightDataClient()
+        dataframe = client.fetch_profiles(urls)
+        profile_map = BrightDataClient.dataframe_to_profile_map(dataframe)
+
+        for item in profiles:
+            candidates: List[str] = []
+            if item.profile_url:
+                candidates.append(item.profile_url.lower())
+            if item.account:
+                candidates.append(f"https://instagram.com/{item.account}".lower())
+                candidates.append(item.account.lower())
+
+            match = None
+            for key in candidates:
+                if key in profile_map:
+                    match = profile_map[key]
+                    break
+
+            if not match:
+                continue
+
+            biography = match.get('biography') or match.get('bio')
+            if biography:
+                item.biography = str(biography)
+
+            followers = match.get('followers') or match.get('followers_count')
+            if followers is not None:
+                try:
+                    item.followers = int(followers)
+                except (TypeError, ValueError):
+                    pass
+
+            posts_value = match.get('posts') or match.get('posts_json')
+            if posts_value:
+                item.posts_raw = posts_value
+
+    def run_profile_fit_preview(
+        self,
+        *,
+        business_fit_query: str,
+        account: Optional[str] = None,
+        profile_url: Optional[str] = None,
+        max_posts: int = 6,
+        model: str = "gpt-5-mini",
+        verbosity: str = "medium",
+        use_brightdata: bool = False,
+        concurrency: int = 2,
+    ) -> ProfileFitResult:
+        """Score a single profile against a business brief."""
+        if not business_fit_query:
+            raise ValueError("business_fit_query is required")
+
+        profile: Optional[SearchResult] = None
+        if account:
+            profile = self.get_creator_by_username(account)
+
+        if profile is None and profile_url:
+            profile = self._get_profile_by_url(profile_url)
+
+        if profile is None:
+            raise ValueError("Profile not found for profile fit preview")
+
+        profiles = [profile]
+        if use_brightdata:
+            try:
+                self._refresh_profiles_with_brightdata(profiles)
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f'[WARN] BrightData refresh failed: {exc}')
+
+        assessor = ProfileFitAssessor(
+            business_query=business_fit_query,
+            model=model,
+            verbosity=verbosity,
+            max_posts=max_posts,
+            concurrency=max(1, concurrency),
+        )
+
+        documents = [
+            {
+                "account": profile.account,
+                "profile_url": profile.profile_url or (f"https://instagram.com/{profile.account}" if profile.account else None),
+                "followers": profile.followers,
+                "biography": profile.biography,
+                "profile_name": profile.profile_name,
+                "business_category_name": profile.business_category_name,
+                "category_name": profile.business_category_name,
+                "is_verified": profile.is_verified,
+                "posts": profile.posts_raw,
+            }
+        ]
+
+        fit_result = assessor.score_profiles(documents)[0]
+        profile.fit_score = fit_result.score
+        profile.fit_rationale = fit_result.rationale
+        profile.fit_error = fit_result.error
+        return fit_result
+
+    def _get_profile_by_url(self, profile_url: str) -> Optional[SearchResult]:
+        """Fetch a single creator profile by profile_url."""
+        if not profile_url:
+            return None
+
+        normalized = profile_url.strip().replace("'", "''")
+        if not normalized:
+            return None
+
+        self.engine.connect()
+        table = getattr(self.engine, 'table', None)
+        if table is None:
+            return None
+
+        queries = [
+            f"profile_url = '{normalized}'",
+            f"LOWER(profile_url) = '{normalized.lower()}'",
+        ]
+
+        for query in queries:
+            try:
+                results = table.search().where(query).to_pandas()
+            except Exception:
+                continue
+
+            if not results.empty:
+                row = results.iloc[0]
+                return self._convert_to_search_result(row)
+
+        return None
 
     def get_creator_by_username(self, username: str) -> Optional[SearchResult]:
         """Fetch a single creator profile by username."""
