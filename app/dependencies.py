@@ -7,6 +7,7 @@ from app.config import settings
 
 # Global instances
 _search_engine = None
+_text_search_engine = None
 _image_refresh_service = None
 _post_filter_ready = False
 
@@ -28,7 +29,7 @@ def init_search_engine() -> bool:
         if os.path.exists(db_path):
             _search_engine = FastAPISearchEngine(db_path)
             print("✅ Search engine initialized")
-            print("   • DB path: {db_path}")
+            print(f"   • DB path: {db_path}")
             _post_filter_ready = True
             return True
         else:
@@ -93,3 +94,50 @@ async def get_optional_search_engine():
 async def get_optional_image_refresh_service():
     """Get image refresh service if available, None otherwise"""
     return _image_refresh_service
+
+
+def init_text_search_engine() -> bool:
+    """Initialize the plaintext biography search engine."""
+    global _text_search_engine
+    try:
+        from app.core.text_search import TextSearchEngine
+
+        table_path = settings.TEXT_DB_PATH or os.path.join(
+            get_project_root(), "DIME-AI-DB", "influencers_lancedb"
+        )
+
+        if not os.path.exists(table_path):
+            print(f"⚠️ Biography dataset not found at: {table_path}")
+            return False
+
+        if _search_engine is None and not init_search_engine():
+            print("⚠️ Unable to initialize primary search engine; text search unavailable")
+            return False
+
+        _text_search_engine = TextSearchEngine(
+            table_path=table_path,
+            table_name=settings.TABLE_NAME or "influencer_facets",
+            vector_engine=_search_engine,
+        )
+        print("✅ Text search engine initialized")
+        print(f"   • Text DB path: {table_path}")
+        return True
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Error initializing text search engine: {exc}")
+        _text_search_engine = None
+        return False
+
+
+def get_text_search_engine():
+    """Dependency to get text search engine instance"""
+    if _text_search_engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Text search engine not initialized."
+        )
+    return _text_search_engine
+
+
+async def get_optional_text_search_engine():
+    """Get text search engine if available, None otherwise"""
+    return _text_search_engine

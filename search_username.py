@@ -16,10 +16,16 @@ import pandas as pd
 def connect_to_database(db_path: str = None) -> lancedb.DBConnection:
     """Connect to the LanceDB database"""
     if not db_path:
-        # Use the same path logic as in config.py
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(current_dir)
-        db_path = os.path.join(project_root, "DIME-AI-DB", "influencers_vectordb")
+        combined_path = os.path.join(
+            project_root,
+            "DIME-AI-DB",
+            "data",
+            "lancedb",
+        )
+        legacy_path = os.path.join(project_root, "DIME-AI-DB", "influencers_vectordb")
+        db_path = combined_path if os.path.exists(combined_path) else legacy_path
     
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database not found at: {db_path}")
@@ -27,7 +33,7 @@ def connect_to_database(db_path: str = None) -> lancedb.DBConnection:
     return lancedb.connect(db_path)
 
 
-def search_username(username: str, db_path: str = None, table_name: str = "influencer_profiles") -> List[dict]:
+def search_username(username: str, db_path: str = None, table_name: str = "influencer_facets") -> List[dict]:
     """
     Search for a username in the LanceDB dataset
     
@@ -49,16 +55,16 @@ def search_username(username: str, db_path: str = None, table_name: str = "influ
             raise ValueError(f"Table '{table_name}' not found in database")
         
         table = db.open_table(table_name)
-        
-        # Search for the username
-        # Try exact match first
-        query = f"account = '{username}'"
-        results = table.search().where(query).to_list()
-        
-        # If no exact match, try case-insensitive partial match
+
+        base_condition = "content_type = 'profile'"
+        lowered = username.lower().replace("'", "''")
+
+        exact_query = f"{base_condition} AND LOWER(username) = '{lowered}'"
+        results = table.search().where(exact_query).to_list()
+
         if not results:
-            query = f"LOWER(account) LIKE '%{username.lower()}%'"
-            results = table.search().where(query).to_list()
+            partial_query = f"{base_condition} AND LOWER(username) LIKE '%{lowered}%'"
+            results = table.search().where(partial_query).to_list()
         
         return results
         
@@ -70,20 +76,20 @@ def search_username(username: str, db_path: str = None, table_name: str = "influ
 def format_result(result: dict) -> str:
     """Format a search result for display"""
     output = []
-    output.append(f"Account: {result.get('account', 'N/A')}")
-    output.append(f"Profile Name: {result.get('profile_name', 'N/A')}")
-    output.append(f"Followers: {result.get('followers_formatted', result.get('followers', 'N/A'))}")
-    output.append(f"Business Category: {result.get('business_category_name', 'N/A')}")
-    output.append(f"Business Address: {result.get('business_address', 'N/A')}")
-    output.append(f"Biography: {result.get('biography', 'N/A')[:100]}...")
+    output.append(f"Account: {result.get('account') or result.get('username', 'N/A')}")
+    output.append(f"Profile Name: {result.get('profile_name') or result.get('display_name', 'N/A')}")
+    output.append(f"Followers: {result.get('followers_formatted') or result.get('followers', 'N/A')}")
+    output.append(f"Business Category: {result.get('business_category_name') or result.get('occupation', 'N/A')}")
+    output.append(f"Business Address: {result.get('business_address') or result.get('location', 'N/A')}")
+    output.append(f"Biography: {(result.get('biography') or '')[:100]}...")
     
     # Add engagement metrics if available
     if 'avg_engagement' in result:
         output.append(f"Avg Engagement: {result['avg_engagement']:.2f}")
     
     # Add profile image link if available
-    if result.get('profile_image_link'):
-        output.append(f"Profile Image: {result['profile_image_link']}")
+    if result.get('profile_image_link') or result.get('profile_image_url'):
+        output.append(f"Profile Image: {result.get('profile_image_link') or result.get('profile_image_url')}")
     
     return "\n".join(output)
 
@@ -93,7 +99,7 @@ def main():
     parser = argparse.ArgumentParser(description="Search for a username in LanceDB dataset")
     parser.add_argument("username", help="Username to search for")
     parser.add_argument("--db-path", help="Path to LanceDB database")
-    parser.add_argument("--table", default="influencer_profiles", help="Table name (default: influencer_profiles)")
+    parser.add_argument("--table", default="influencer_facets", help="Table name (default: influencer_facets)")
     parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     parser.add_argument("--limit", type=int, default=10, help="Limit number of results (default: 10)")
     

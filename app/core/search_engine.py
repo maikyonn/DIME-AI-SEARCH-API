@@ -1,12 +1,11 @@
 """
-FastAPI wrapper for the vector search engine.
-This module provides a clean interface to the new three-vector search functionality.
+FastAPI wrapper for the LanceDB facet search engine built on influencer_facets.
+Provides higher-level orchestration for dense, lexical, and hybrid retrieval.
 """
 import os
 import sys
-import pandas as pd
 import json
-from typing import List, Optional, Dict, Any, Tuple, Union
+from typing import List, Optional, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
 
 # Add the DIME-AI-DB src directory to path
@@ -20,7 +19,7 @@ for path in (dime_db_root, dime_db_src):
         sys.path.insert(0, path)
 
 # Import from the new vector search engine
-from search.vector_search import VectorSearchEngine, SearchWeights
+from .vector_search import VectorSearchEngine, SearchWeights, SearchParams
 from app.core.post_filter import BrightDataClient, ProfileFitAssessor, ProfileFitResult
 from app.config import settings
 
@@ -40,22 +39,31 @@ class SearchResult:
     is_personal_creator: bool = True
     is_verified: Optional[bool] = None
     posts_raw: Optional[str] = None
+    lance_db_id: Optional[str] = None
+    platform: Optional[str] = None
+    platform_id: Optional[str] = None
+    username: Optional[str] = None
+    display_name: Optional[str] = None
+    profile_image_url: Optional[str] = None
     # Original database LLM score columns
     individual_vs_org_score: int = 0
     generational_appeal_score: int = 0
     professionalization_score: int = 0
     relationship_status_score: int = 0
-    # Vector search similarity scores (text-based search)
-    keyword_score: float = 0.0
-    profile_score: float = 0.0
-    content_score: float = 0.0
+    # Search score components
+    bm25_fts_score: Optional[float] = None
+    cos_sim_profile: Optional[float] = None
+    cos_sim_posts: Optional[float] = None
     combined_score: float = 0.0
     # Vector similarity scores (direct vector comparison)
-    keyword_similarity: float = 0.0
-    profile_similarity: float = 0.0
-    content_similarity: float = 0.0
-    vector_similarity_score: float = 0.0
+    keyword_similarity: Optional[float] = None
+    profile_similarity: Optional[float] = None
+    content_similarity: Optional[float] = None
+    vector_similarity_score: Optional[float] = None
     similarity_explanation: str = ""
+    score_mode: str = "hybrid"
+    profile_fts_source: Optional[str] = None
+    posts_fts_source: Optional[str] = None
     fit_score: Optional[int] = None
     fit_rationale: Optional[str] = None
     fit_error: Optional[str] = None
@@ -69,7 +77,7 @@ class FastAPISearchEngine:
     def __init__(self, db_path: str):
         self.engine = VectorSearchEngine(
             db_path=db_path,
-            table_name="influencer_profiles"
+            table_name=settings.TABLE_NAME or "influencer_facets",
         )
         
         # Content categories for campaign matching
@@ -102,12 +110,23 @@ class FastAPISearchEngine:
                 return float(value)
             except (ValueError, TypeError):
                 return default
-        
+
+        def safe_optional_float(value):
+            if value is None or (isinstance(value, float) and str(value).lower() == 'nan'):
+                return None
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return None
+
         def safe_str(value):
             if value is None:
                 return None
             text_value = str(value)
             return text_value if text_value.lower() != 'nan' else None
+
+        lance_identifier = safe_str(row.get('lance_db_id'))
+        platform_value = safe_str(row.get('platform'))
 
         def safe_bool(value):
             if isinstance(value, bool):
@@ -121,36 +140,54 @@ class FastAPISearchEngine:
                 return False
             return None
 
+        lance_identifier = safe_str(row.get('lance_db_id'))
+        platform_value = safe_str(row.get('platform'))
+        account_value = safe_str(row.get('account') or row.get('username') or row.get('display_name')) or ""
+        profile_name_value = safe_str(row.get('profile_name') or row.get('display_name') or row.get('username') or account_value) or ""
+        avg_engagement_value = safe_float(row.get('avg_engagement', row.get('engagement_rate', 0.0)), 0.0)
+        business_category = safe_str(row.get('business_category_name') or row.get('occupation') or '') or ''
+        business_address = safe_str(row.get('business_address') or row.get('location') or '') or ''
+        posts_raw_value = safe_str(row.get('posts') or row.get('posts_raw'))
+
         return SearchResult(
-            id=safe_int(row.get('id', row.get('lance_db_id', 0))),
-            account=str(row.get('account', '')),
-            profile_name=str(row.get('profile_name', '')),
+            id=safe_int(row.get('id', lance_identifier or 0)),
+            account=account_value,
+            profile_name=profile_name_value,
             followers=safe_int(row.get('followers', 0)),
-            avg_engagement=safe_float(row.get('avg_engagement', 0.0)),
-            business_category_name=str(row.get('business_category_name', '')),
-            business_address=str(row.get('business_address', '')),
-            biography=str(row.get('biography', '')),
-            profile_image_link=str(row.get('profile_image_link', '')),
+            avg_engagement=avg_engagement_value,
+            business_category_name=business_category,
+            business_address=business_address,
+            biography=str(row.get('biography', '') or row.get('profile_text') or ''),
+            profile_image_link=str(row.get('profile_image_link') or row.get('profile_image_url') or ''),
             profile_url=safe_str(row.get('profile_url') or row.get('url')),
             is_personal_creator=bool(safe_int(row.get('individual_vs_org_score', 5)) < 5),
             is_verified=safe_bool(row.get('is_verified')),
-            posts_raw=safe_str(row.get('posts')),
+            posts_raw=posts_raw_value,
+            lance_db_id=lance_identifier,
+            platform=platform_value.lower() if isinstance(platform_value, str) else platform_value,
+            platform_id=safe_str(row.get('platform_id')),
+            username=safe_str(row.get('username') or row.get('account')),
+            display_name=safe_str(row.get('display_name') or row.get('profile_name') or row.get('full_name')),
+            profile_image_url=safe_str(row.get('profile_image_link') or row.get('profile_image_url')),
             # Original database LLM score columns (keep as integers)
             individual_vs_org_score=safe_int(row.get('individual_vs_org_score', 0)),
             generational_appeal_score=safe_int(row.get('generational_appeal_score', 0)),
             professionalization_score=safe_int(row.get('professionalization_score', 0)),
             relationship_status_score=safe_int(row.get('relationship_status_score', 0)),
-            # Vector search similarity scores (text-based search)
-            keyword_score=safe_float(row.get('keyword_score', 0.0)),
-            profile_score=safe_float(row.get('profile_score', 0.0)),
-            content_score=safe_float(row.get('content_score', 0.0)),
-            combined_score=safe_float(row.get('combined_score', 0.0)),
+            # Search score components
+            bm25_fts_score=safe_optional_float(row.get('bm25_fts_score')),
+            cos_sim_profile=safe_optional_float(row.get('cos_sim_profile')),
+            cos_sim_posts=safe_optional_float(row.get('cos_sim_posts')),
+            combined_score=safe_float(row.get('combined_score', row.get('vector_similarity_score', 0.0))),
             # Vector similarity scores (direct vector comparison)
-            keyword_similarity=safe_float(row.get('keyword_similarity', 0.0)),
-            profile_similarity=safe_float(row.get('profile_similarity', 0.0)),
-            content_similarity=safe_float(row.get('content_similarity', 0.0)),
-            vector_similarity_score=safe_float(row.get('vector_similarity_score', 0.0)),
+            keyword_similarity=safe_optional_float(row.get('keyword_similarity')),
+            profile_similarity=safe_optional_float(row.get('profile_similarity')),
+            content_similarity=safe_optional_float(row.get('content_similarity')),
+            vector_similarity_score=safe_optional_float(row.get('vector_similarity_score')),
             similarity_explanation=str(row.get('similarity_explanation', '')),
+            score_mode=(safe_str(row.get('score_mode')) or 'hybrid'),
+            profile_fts_source=safe_str(row.get('profile_fts_source')),
+            posts_fts_source=safe_str(row.get('posts_fts_source')),
             fit_score=None,
             fit_rationale=None,
             fit_error=None,
@@ -160,175 +197,154 @@ class FastAPISearchEngine:
         
     def search_creators_for_campaign(
         self,
+        *,
         query: str,
         method: str = "hybrid",
         limit: int = 20,
-        min_followers: int = 0,
+        min_followers: Optional[int] = None,
         max_followers: Optional[int] = None,
-        min_engagement: float = 0.0,
+        min_engagement: Optional[float] = None,
         max_engagement: Optional[float] = None,
-        location_filter: Optional[str] = None,
-        target_category: Optional[str] = None,
-        relevance_keywords: Optional[List[str]] = None,
-        custom_weights: Optional[Dict[str, float]] = None,
-        similarity_threshold: Optional[float] = None,
-        return_vectors: bool = False,
-        business_fit_query: Optional[str] = None,
-        post_filter_limit: Optional[int] = None,
-        post_filter_concurrency: int = 8,
-        post_filter_max_posts: int = 6,
-        post_filter_model: str = "gpt-5-mini",
-        post_filter_verbosity: str = "medium",
-        post_filter_use_brightdata: bool = False,
-        return_debug: bool = False,
-        # Account Type Filters
+        location: Optional[str] = None,
+        category: Optional[str] = None,
         is_verified: Optional[bool] = None,
         is_business_account: Optional[bool] = None,
-        # LLM Score Filters
-        min_individual_vs_org_score: Optional[int] = None,
-        max_individual_vs_org_score: Optional[int] = None,
-        min_generational_appeal_score: Optional[int] = None,
-        max_generational_appeal_score: Optional[int] = None,
-        min_professionalization_score: Optional[int] = None,
-        max_professionalization_score: Optional[int] = None,
-        min_relationship_status_score: Optional[int] = None,
-        max_relationship_status_score: Optional[int] = None,
-        # Content Stats Filters
-        min_posts_count: Optional[int] = None,
-        max_posts_count: Optional[int] = None,
-        min_following: Optional[int] = None,
-        max_following: Optional[int] = None
-    ) -> Union[List[SearchResult], Tuple[List[SearchResult], Dict[str, Any]]]:
-        """Search creators for a campaign using vector search"""
-        
-        # Build enhanced query with keywords
-        enhanced_query = query
-        if relevance_keywords:
-            enhanced_query += " " + " ".join(relevance_keywords)
-        if target_category and target_category in self.content_categories:
-            category_keywords = " ".join(self.content_categories[target_category][:5])
-            enhanced_query += " " + category_keywords
-        
-        # Convert custom weights to SearchWeights
-        weights = None
-        if custom_weights:
-            weights = SearchWeights(
-                keyword=custom_weights.get('keyword', 0.33),
-                profile=custom_weights.get('profile', 0.33),
-                content=custom_weights.get('content', 0.34)
+        lexical_scope: str = "bio",
+    ) -> List[SearchResult]:
+        """Run a single-pass search with predictable behaviour."""
+
+        method_lower = (method or "").strip().lower()
+
+        query_text = (query or "").strip()
+        if not query_text:
+            return []
+
+        filters: Dict[str, Any] = {}
+
+        follower_lower = int(min_followers) if min_followers is not None else None
+        follower_upper = int(max_followers) if max_followers is not None else None
+        if follower_lower is not None or follower_upper is not None:
+            filters["followers"] = (
+                follower_lower if follower_lower is not None else 0,
+                follower_upper,
             )
-        elif method == "keyword":
-            weights = SearchWeights(keyword=0.7, profile=0.2, content=0.1)
-        elif method == "profile":
-            weights = SearchWeights(keyword=0.3, profile=0.6, content=0.1)
-        elif method == "content":
-            weights = SearchWeights(keyword=0.2, profile=0.3, content=0.5)
-        
-        # Build filters with enhanced validation
-        filters = {}
-        
-        # Handle follower filters with flexible ranges
-        if max_followers is not None:
-            filters['followers'] = (int(min_followers), int(max_followers))
-        elif min_followers > 0:
-            filters['followers'] = (int(min_followers), 100000000)  # Large upper bound
-        
-        # Handle engagement filters with flexible ranges
-        if min_engagement is not None or max_engagement is not None:
-            min_eng = float(min_engagement) if min_engagement is not None else 0.0
-            max_eng = float(max_engagement) if max_engagement is not None else 1.0
-            if min_eng > 0 or max_eng < 1.0:
-                filters['engagement_rate'] = (min_eng, max_eng)
-        
-        # Handle account type filters
+
+        eng_lower = float(min_engagement) if min_engagement is not None else None
+        eng_upper = float(max_engagement) if max_engagement is not None else None
+        if eng_lower is not None or eng_upper is not None:
+            filters["engagement_rate"] = (
+                eng_lower if eng_lower is not None else 0.0,
+                eng_upper,
+            )
+
         if is_verified is not None:
-            filters['is_verified'] = is_verified
+            filters["is_verified"] = is_verified
+
         if is_business_account is not None:
-            filters['is_business_account'] = is_business_account
-        
-        # Handle content stats filters
-        if min_posts_count is not None or max_posts_count is not None:
-            min_posts = int(min_posts_count) if min_posts_count is not None else 0
-            max_posts = int(max_posts_count) if max_posts_count is not None else 100000
-            filters['posts_count'] = (min_posts, max_posts)
-        
-        if min_following is not None or max_following is not None:
-            min_fol = int(min_following) if min_following is not None else 0
-            max_fol = int(max_following) if max_following is not None else 100000000
-            filters['following'] = (min_fol, max_fol)
-        
-        # Handle LLM score filters
-        if min_individual_vs_org_score is not None and max_individual_vs_org_score is not None:
-            filters['individual_vs_org_score'] = (int(min_individual_vs_org_score), int(max_individual_vs_org_score))
-        elif min_individual_vs_org_score is not None:
-            filters['individual_vs_org_score'] = (int(min_individual_vs_org_score), 10)
-        elif max_individual_vs_org_score is not None:
-            filters['individual_vs_org_score'] = (0, int(max_individual_vs_org_score))
-            
-        if min_generational_appeal_score is not None and max_generational_appeal_score is not None:
-            filters['generational_appeal_score'] = (int(min_generational_appeal_score), int(max_generational_appeal_score))
-        elif min_generational_appeal_score is not None:
-            filters['generational_appeal_score'] = (int(min_generational_appeal_score), 10)
-        elif max_generational_appeal_score is not None:
-            filters['generational_appeal_score'] = (0, int(max_generational_appeal_score))
-            
-        if min_professionalization_score is not None and max_professionalization_score is not None:
-            filters['professionalization_score'] = (int(min_professionalization_score), int(max_professionalization_score))
-        elif min_professionalization_score is not None:
-            filters['professionalization_score'] = (int(min_professionalization_score), 10)
-        elif max_professionalization_score is not None:
-            filters['professionalization_score'] = (0, int(max_professionalization_score))
-            
-        if min_relationship_status_score is not None and max_relationship_status_score is not None:
-            filters['relationship_status_score'] = (int(min_relationship_status_score), int(max_relationship_status_score))
-        elif min_relationship_status_score is not None:
-            filters['relationship_status_score'] = (int(min_relationship_status_score), 10)
-        elif max_relationship_status_score is not None:
-            filters['relationship_status_score'] = (0, int(max_relationship_status_score))
-        
-        # Perform search
-        results_df = self.engine.search(
-            query=enhanced_query,
-            limit=limit,
-            weights=weights,
-            filters=filters if filters else None
+            filters["is_business_account"] = is_business_account
+
+        if location:
+            filters["location"] = location.strip()
+
+        if category:
+            filters["business_category_name"] = category.strip()
+
+        params = SearchParams(
+            query=query_text,
+            method=method_lower,
+            limit=max(1, limit),
+            filters=filters or None,
+            lexical_include_posts=(method_lower == "lexical" and lexical_scope == "bio_posts"),
         )
-        
-        # Convert to SearchResult objects
+
+        results_df = self.engine.search(params=params)
+
         search_results: List[SearchResult] = []
         for _, row in results_df.iterrows():
             search_results.append(self._convert_to_search_result(row))
 
-        debug_payload: Dict[str, Any] = {
-            "vector_results": json.loads(results_df.to_json(orient="records")),
-            "brightdata_results": [],
-            "profile_fit": [],
-            "vector_query": vector_query,
-            "business_query": business_query,
-        }
-
-        if business_fit_query:
-            fit_limit = post_filter_limit or len(search_results)
-            try:
-                search_results, fit_debug = self._apply_profile_fit(
-                    search_results,
-                    business_fit_query=business_fit_query,
-                    limit=fit_limit,
-                    concurrency=post_filter_concurrency,
-                    max_posts=post_filter_max_posts,
-                    model=post_filter_model,
-                    verbosity=post_filter_verbosity,
-                    use_brightdata=post_filter_use_brightdata,
-                )
-                debug_payload.update(fit_debug)
-            except Exception as exc:  # pylint: disable=broad-except
-                print(f'[WARN] Post-filter stage failed: {exc}')
-                debug_payload["post_filter_error"] = str(exc)
-
-        if return_debug:
-            return search_results, debug_payload
+        for item in search_results:
+            item.score_mode = method_lower or "hybrid"
+            if method_lower == "lexical":
+                item.cos_sim_profile = None
+                item.cos_sim_posts = None
+                item.vector_similarity_score = None
+                item.keyword_similarity = None
+                item.profile_similarity = None
+                item.content_similarity = None
+            elif method_lower == "semantic":
+                item.bm25_fts_score = None
+                item.profile_fts_source = None
+                item.posts_fts_source = None
 
         return search_results
+
+    def evaluate_profiles(
+        self,
+        profiles: List[Dict[str, Any]],
+        *,
+        business_fit_query: Optional[str] = None,
+        run_brightdata: bool = False,
+        run_llm: bool = False,
+        max_profiles: Optional[int] = None,
+        max_posts: int = 6,
+        model: str = "gpt-5-mini",
+        verbosity: str = "medium",
+        concurrency: int = 64,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> Tuple[List[SearchResult], Dict[str, Any]]:
+        """Run optional BrightData refresh and/or LLM scoring on a result set."""
+
+        if not profiles:
+            return [], {"brightdata_results": [], "profile_fit": []}
+
+        if max_profiles is None:
+            limit_count = len(profiles)
+        else:
+            limit_count = max(1, min(int(max_profiles), len(profiles)))
+
+        limited_payloads = profiles[: limit_count]
+        search_results = [self._convert_to_search_result(payload) for payload in limited_payloads]
+
+        debug: Dict[str, Any] = {
+            "brightdata_results": [],
+            "profile_fit": [],
+        }
+
+        if progress_cb:
+            progress_cb("evaluation_started", {"count": len(limited_payloads), "run_brightdata": run_brightdata, "run_llm": run_llm})
+
+        if run_llm:
+            if not business_fit_query:
+                raise ValueError("business_fit_query is required when run_llm is True")
+
+            search_results, fit_debug = self._apply_profile_fit(
+                search_results,
+                business_fit_query=business_fit_query,
+                limit=len(search_results),
+                concurrency=concurrency,
+                max_posts=max_posts,
+                model=model,
+                verbosity=verbosity,
+                use_brightdata=run_brightdata,
+                progress_cb=progress_cb,
+            )
+            debug.update(fit_debug)
+            return search_results, debug
+
+        if run_brightdata:
+            if progress_cb:
+                progress_cb("brightdata_started", {"count": len(search_results)})
+            try:
+                debug["brightdata_results"] = self._refresh_profiles_with_brightdata(search_results)
+            except Exception as exc:  # pylint: disable=broad-except
+                debug["brightdata_error"] = str(exc)
+            else:
+                if progress_cb:
+                    debug_count = len(debug["brightdata_results"])
+                    progress_cb("brightdata_completed", {"count": debug_count})
+
+        return search_results, debug
 
     def _apply_profile_fit(
         self,
@@ -341,6 +357,7 @@ class FastAPISearchEngine:
         model: str,
         verbosity: str,
         use_brightdata: bool,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> Tuple[List[SearchResult], Dict[str, Any]]:
         """Run stage-two LLM scoring and re-rank results."""
         if not results:
@@ -352,10 +369,23 @@ class FastAPISearchEngine:
 
         brightdata_records: List[Dict[str, Any]] = []
         if use_brightdata:
+            if progress_cb:
+                progress_cb("brightdata_started", {"count": len(subset)})
             try:
                 brightdata_records = self._refresh_profiles_with_brightdata(subset)
             except Exception as exc:  # pylint: disable=broad-except
                 print(f'[WARN] BrightData refresh failed: {exc}')
+                if progress_cb:
+                    progress_cb(
+                        "brightdata_completed",
+                        {"count": 0, "error": str(exc)},
+                    )
+            else:
+                if progress_cb:
+                    progress_cb(
+                        "brightdata_completed",
+                        {"count": len(brightdata_records)},
+                    )
 
         documents = []
         for item in subset:
@@ -383,9 +413,10 @@ class FastAPISearchEngine:
         )
 
         fit_results = assessor.score_profiles(documents)
+        total = len(fit_results)
         fit_map: Dict[str, ProfileFitResult] = {}
         profile_fit_debug: List[Dict[str, Any]] = []
-        for fit in fit_results:
+        for idx, fit in enumerate(fit_results, start=1):
             key = (fit.account or '').lower() if fit.account else None
             if key:
                 fit_map[key] = fit
@@ -404,6 +435,8 @@ class FastAPISearchEngine:
                     "raw_response": fit.raw_response,
                 }
             )
+            if progress_cb:
+                progress_cb("fit_progress", {"completed": idx, "total": total, "account": fit.account})
 
         for item in subset:
             fit: Optional[ProfileFitResult] = None
@@ -425,6 +458,9 @@ class FastAPISearchEngine:
                 item.fit_error = None
                 item.fit_prompt = None
                 item.fit_raw_response = None
+
+        if progress_cb:
+            progress_cb("fit_completed", {"total": total})
 
         scored_subset = sorted(
             subset,
@@ -560,27 +596,21 @@ class FastAPISearchEngine:
         if not normalized:
             return None
 
-        self.engine.connect()
-        table = getattr(self.engine, 'table', None)
-        if table is None:
+        profile_row = self.engine.get_profile_by_url(normalized)
+        if profile_row is None:
             return None
 
-        queries = [
-            f"profile_url = '{normalized}'",
-            f"LOWER(profile_url) = '{normalized.lower()}'",
-        ]
-
-        for query in queries:
-            try:
-                results = table.search().where(query).to_pandas()
-            except Exception:
-                continue
-
-            if not results.empty:
-                row = results.iloc[0]
-                return self._convert_to_search_result(row)
-
-        return None
+        row = profile_row.copy()
+        row['account'] = row.get('username') or row.get('account') or ''
+        row['profile_name'] = row.get('display_name') or row.get('profile_name') or row.get('username') or ''
+        row.setdefault('bm25_fts_score', row.get('keyword_score'))
+        row.setdefault('cos_sim_profile', row.get('profile_score'))
+        row.setdefault('cos_sim_posts', row.get('content_score'))
+        row.setdefault('profile_fts_source', row.get('profile_text'))
+        row.setdefault('posts_fts_source', row.get('posts_text'))
+        row.setdefault('combined_score', row.get('cos_sim_profile'))
+        row.setdefault('vector_similarity_score', row.get('combined_score'))
+        return self._convert_to_search_result(row)
 
     def get_creator_by_username(self, username: str) -> Optional[SearchResult]:
         """Fetch a single creator profile by username."""
@@ -591,52 +621,37 @@ class FastAPISearchEngine:
         if not normalized:
             return None
 
-        # Escape single quotes to avoid query syntax issues
-        sanitized = normalized.replace("'", "''")
-
-        # Ensure the underlying table connection is available
-        self.engine.connect()
-        table = getattr(self.engine, 'table', None)
-        if table is None:
+        profile_row = self.engine.get_profile_by_username(normalized)
+        if profile_row is None or getattr(profile_row, 'empty', False):
             return None
 
-        # Try exact match first, then case-insensitive, then partial match
-        queries = [
-            f"account = '{sanitized}'",
-            f"LOWER(account) = '{sanitized.lower()}'",
-            f"LOWER(account) LIKE '%{sanitized.lower()}%'"
-        ]
-
-        for query in queries:
-            try:
-                results = table.search().where(query).to_pandas()
-            except Exception:
-                continue
-
-            if not results.empty:
-                # Prefer the exact match order by placing the most relevant row first
-                row = results.iloc[0]
-                return self._convert_to_search_result(row)
-
-        return None
+        row = profile_row.copy()
+        row['account'] = row.get('username') or normalized
+        row['profile_name'] = row.get('display_name') or row.get('username') or normalized
+        row.setdefault('bm25_fts_score', row.get('keyword_score'))
+        row.setdefault('cos_sim_profile', row.get('profile_score'))
+        row.setdefault('cos_sim_posts', row.get('content_score'))
+        row.setdefault('profile_fts_source', row.get('profile_text'))
+        row.setdefault('posts_fts_source', row.get('posts_text'))
+        row.setdefault('combined_score', row.get('cos_sim_profile'))
+        row.setdefault('vector_similarity_score', row.get('combined_score'))
+        return self._convert_to_search_result(row)
     
     def match_creators_to_business(
         self,
         business_description: str,
         method: str = "hybrid",
         limit: int = 20,
-        custom_weights: Optional[Dict[str, float]] = None,
-        min_followers: int = 1000,
-        max_followers: int = 10000000,
+        min_followers: Optional[int] = 1000,
+        max_followers: Optional[int] = 10000000,
         min_engagement: float = 0.0,
-        location_filter: Optional[str] = None,
-        target_category: Optional[str] = None
+        location: Optional[str] = None,
+        target_category: Optional[str] = None,
     ) -> List[SearchResult]:
-        """Match creators to business description using vector search"""
-        
-        # Transform business description into creator search query
+        """Match creators to a business brief using the simplified search pipeline."""
+
         search_query = self._business_to_creator_query(business_description, target_category)
-        
+
         return self.search_creators_for_campaign(
             query=search_query,
             method=method,
@@ -644,9 +659,8 @@ class FastAPISearchEngine:
             min_followers=min_followers,
             max_followers=max_followers,
             min_engagement=min_engagement,
-            location_filter=location_filter,
-            target_category=target_category,
-            custom_weights=custom_weights
+            location=location,
+            category=target_category,
         )
     
     def _business_to_creator_query(self, business_description: str, target_category: Optional[str] = None) -> str:
@@ -667,75 +681,50 @@ class FastAPISearchEngine:
         self,
         reference_account: str,
         limit: int = 10,
-        min_followers: int = 0,
+        min_followers: Optional[int] = None,
         max_followers: Optional[int] = None,
         min_engagement: Optional[float] = None,
         max_engagement: Optional[float] = None,
-        location_filter: Optional[str] = None,
-        target_category: Optional[str] = None,
-        similarity_threshold: float = 0.1,
-        use_vector_similarity: bool = True,
-        custom_weights: Optional[Dict[str, float]] = None
+        location: Optional[str] = None,
+        category: Optional[str] = None,
     ) -> List[SearchResult]:
-        """Find similar creators to a reference account using advanced vector similarity"""
-        
-        # Build filters with enhanced validation
-        filters = {}
-        
-        # Handle follower filters
-        if max_followers is not None:
-            filters['followers'] = (int(min_followers), int(max_followers))
-        elif min_followers > 0:
-            filters['followers'] = (int(min_followers), 100000000)
-        
-        # Handle engagement filters
-        if min_engagement is not None or max_engagement is not None:
-            min_eng = float(min_engagement) if min_engagement is not None else 0.0
-            max_eng = float(max_engagement) if max_engagement is not None else 1.0
-            if min_eng > 0 or max_eng < 1.0:
-                filters['engagement_rate'] = (min_eng, max_eng)
-        
-        # Convert custom weights if provided
-        weights = SearchWeights(keyword=0.4, profile=0.4, content=0.2)
-        if custom_weights:
-            weights = SearchWeights(
-                keyword=custom_weights.get('keyword', 0.4),
-                profile=custom_weights.get('profile', 0.4),
-                content=custom_weights.get('content', 0.2)
+        """Find creators similar to a reference account using vector similarity."""
+
+        filters: Dict[str, Any] = {}
+
+        follower_lower = int(min_followers) if min_followers is not None else None
+        follower_upper = int(max_followers) if max_followers is not None else None
+        if follower_lower is not None or follower_upper is not None:
+            filters["followers"] = (
+                follower_lower if follower_lower is not None else 0,
+                follower_upper,
             )
-        
-        # Use the new vector-based similarity search by default
-        if use_vector_similarity:
-            results_df = self.engine.search_similar_by_vectors(
-                account_name=reference_account,
-                limit=limit,
-                weights=weights,
-                similarity_threshold=similarity_threshold,
-                include_similarity_scores=True,
-                filters=filters if filters else None
+
+        eng_lower = float(min_engagement) if min_engagement is not None else None
+        eng_upper = float(max_engagement) if max_engagement is not None else None
+        if eng_lower is not None or eng_upper is not None:
+            filters["engagement_rate"] = (
+                eng_lower if eng_lower is not None else 0.0,
+                eng_upper,
             )
-        else:
-            # Fallback to legacy text-based search
-            results_df = self.engine.search_similar_profiles(
-                account_name=reference_account,
-                limit=limit,
-                weights=weights
-            )
-            
-            # Apply filters manually for legacy method if needed
-            if filters and not results_df.empty:
-                if 'followers' in filters:
-                    min_fol, max_fol = filters['followers']
-                    results_df = results_df[(results_df['followers'] >= min_fol) & (results_df['followers'] <= max_fol)]
-                if 'engagement_rate' in filters:
-                    min_eng, max_eng = filters['engagement_rate']
-                    results_df = results_df[(results_df['avg_engagement'] >= min_eng) & (results_df['avg_engagement'] <= max_eng)]
-        
-        # Convert to SearchResult objects
-        search_results = []
+
+        if location:
+            filters["location"] = location.strip()
+
+        if category:
+            filters["business_category_name"] = category.strip()
+
+        results_df = self.engine.search_similar_by_vectors(
+            account_name=reference_account,
+            limit=limit,
+            weights=SearchWeights(keyword=0.2, profile=0.5, content=0.3),
+            filters=filters or None,
+        )
+
+        search_results: List[SearchResult] = []
         for _, row in results_df.iterrows():
             search_results.append(self._convert_to_search_result(row))
-        
+
         return search_results
     
     def search_by_category(
@@ -743,60 +732,29 @@ class FastAPISearchEngine:
         category: str,
         location: Optional[str] = None,
         limit: int = 15,
-        min_followers: int = 0,
+        min_followers: Optional[int] = None,
         max_followers: Optional[int] = None,
         min_engagement: Optional[float] = None,
         max_engagement: Optional[float] = None,
-        custom_weights: Optional[Dict[str, float]] = None,
-        similarity_threshold: Optional[float] = None
     ) -> List[SearchResult]:
-        """Search creators by category using vector search"""
-        
-        # Build search query from category
-        query = category
+        """Search creators by category with sensible defaults."""
+
+        query_parts = [category]
         if category in self.content_categories:
-            category_keywords = " ".join(self.content_categories[category][:5])
-            query = f"{category} {category_keywords}"
-        
+            query_parts.extend(self.content_categories[category][:3])
         if location:
-            query += f" {location}"
-        
-        # Build filters with enhanced validation
-        filters = {}
-        
-        # Handle follower filters
-        if max_followers is not None:
-            filters['followers'] = (int(min_followers), int(max_followers))
-        elif min_followers > 0:
-            filters['followers'] = (int(min_followers), 100000000)
-        
-        # Handle engagement filters
-        if min_engagement is not None or max_engagement is not None:
-            min_eng = float(min_engagement) if min_engagement is not None else 0.0
-            max_eng = float(max_engagement) if max_engagement is not None else 1.0
-            if min_eng > 0 or max_eng < 1.0:
-                filters['engagement_rate'] = (min_eng, max_eng)
-        
-        # Convert custom weights or use category-optimized defaults
-        weights = SearchWeights(keyword=0.4, profile=0.5, content=0.1)
-        if custom_weights:
-            weights = SearchWeights(
-                keyword=custom_weights.get('keyword', 0.4),
-                profile=custom_weights.get('profile', 0.5),
-                content=custom_weights.get('content', 0.1)
-            )
-        
-        # Perform search with profile focus for category matching
-        results_df = self.engine.search(
+            query_parts.append(location)
+
+        query = " ".join(query_parts)
+
+        return self.search_creators_for_campaign(
             query=query,
+            method="hybrid",
             limit=limit,
-            weights=weights,
-            filters=filters if filters else None
+            min_followers=min_followers,
+            max_followers=max_followers,
+            min_engagement=min_engagement,
+            max_engagement=max_engagement,
+            location=location,
+            category=category,
         )
-        
-        # Convert to SearchResult objects
-        search_results = []
-        for _, row in results_df.iterrows():
-            search_results.append(self._convert_to_search_result(row))
-        
-        return search_results

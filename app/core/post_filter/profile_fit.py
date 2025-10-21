@@ -56,20 +56,42 @@ def _parse_posts(posts_raw: Any, max_posts: int) -> List[Dict[str, Any]]:
     for post in posts[:max_posts]:
         if not isinstance(post, dict):
             continue
+
+        image_url = post.get("image_url") or post.get("thumbnail_url") or post.get("cover_image")
+        if not image_url:
+            # Skip posts without imagery to avoid leaking social URLs
+            continue
+
+        caption = _append_hashtags(post.get("caption"), post.get("post_hashtags"))
+
         simplified.append(
             {
-                "caption": _truncate(post.get("caption")),
-                "image_url": post.get("image_url"),
+                "caption": _truncate(caption),
+                "image_url": image_url,
                 "video_url": post.get("video_url"),
                 "likes": post.get("likes"),
                 "comments": post.get("comments"),
                 "datetime": post.get("datetime"),
-                "url": post.get("url"),
                 "content_type": post.get("content_type"),
-                "post_hashtags": post.get("post_hashtags"),
             }
         )
     return simplified
+
+
+def _append_hashtags(caption: Optional[str], hashtags: Any) -> str:
+    base = (caption or "").strip()
+
+    tag_list: List[str] = []
+    if isinstance(hashtags, str):
+        tag_list = [tag.strip() for tag in hashtags.split(",") if tag.strip()]
+    elif isinstance(hashtags, list):
+        tag_list = [str(tag).strip() for tag in hashtags if str(tag).strip()]
+
+    if not tag_list:
+        return base
+
+    hash_line = "Hashtags: " + " ".join(f"#{tag.lstrip('#')}" for tag in tag_list)
+    return f"{base}\n{hash_line}" if base else hash_line
 
 
 def build_profile_documents(

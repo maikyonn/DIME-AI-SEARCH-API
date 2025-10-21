@@ -27,6 +27,18 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
+# Resolve combined LanceDB vector path relative to this repo
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+VDB_PATH="${PROJECT_ROOT}/../DIME-AI-DB/data/combined/influencers_vectordb"
+
+if [ -d "$VDB_PATH" ]; then
+    export DB_PATH="$VDB_PATH"
+    echo "📂 Using combined vector database at: $DB_PATH"
+else
+    echo "⚠️  Combined vector database not found at $VDB_PATH"
+    echo "   Falling back to path from configuration (.env or defaults)."
+fi
+
 # Start the FastAPI server
 echo "🌐 Starting FastAPI server..."
 echo "📡 API will be available at: http://localhost:8000"

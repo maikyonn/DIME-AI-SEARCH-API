@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -47,11 +48,12 @@ class BrightDataClient:
         }
 
     def _trigger_job(self, url_objects: List[Dict[str, str]]) -> Optional[str]:
+        payload = url_objects
         response = requests.post(
             f"{self.base_url}/trigger",
             headers=self.headers,
             params={"dataset_id": self.config.dataset_id, "include_errors": "true"},
-            json=url_objects,
+            json=payload,
             timeout=30,
         )
         response.raise_for_status()
@@ -91,16 +93,64 @@ class BrightDataClient:
 
     def fetch_profiles(self, profile_urls: Iterable[str]) -> pd.DataFrame:
         """Trigger a BrightData job for the given profile URLs and return the result dataframe."""
-        url_objects = [{"url": url} for url in profile_urls if url]
+        url_objects = self._prepare_urls(profile_urls)
         if not url_objects:
             raise ValueError("No profile URLs provided to BrightData")
 
-        snapshot_id = self._trigger_job(url_objects)
+        try:
+            snapshot_id = self._trigger_job(url_objects)
+        except requests.HTTPError as exc:
+            detail = exc.response.text if exc.response is not None else str(exc)
+            raise RuntimeError(f"BrightData trigger failed: {detail}") from exc
         if not snapshot_id:
             raise RuntimeError("Failed to trigger BrightData snapshot")
 
         self._wait_for_ready(snapshot_id)
         return self._download_csv(snapshot_id)
+
+    def _prepare_urls(self, profile_urls: Iterable[str]) -> List[Dict[str, str]]:
+        cleaned: List[Dict[str, str]] = []
+        seen: set[str] = set()
+
+        for raw in profile_urls:
+            if not raw:
+                continue
+            url = raw.strip()
+            if not url:
+                continue
+
+            canonical = self._canonicalize_url(url)
+            if not canonical:
+                continue
+            if canonical.lower() in seen:
+                continue
+
+            seen.add(canonical.lower())
+            cleaned.append({"url": canonical})
+
+        return cleaned
+
+    @staticmethod
+    def _canonicalize_url(url: str) -> Optional[str]:
+        try:
+            parsed = urlparse(url.strip())
+        except Exception:
+            return None
+
+        if not parsed.netloc:
+            return None
+
+        scheme = parsed.scheme or 'https'
+        host = parsed.netloc.lower()
+        path = parsed.path.rstrip('/')
+
+        if 'instagram.com' in host:
+            if not path:
+                return None
+            return f"{scheme}://{host}{path}"
+
+        # Unsupported host
+        return None
 
     @staticmethod
     def dataframe_to_profile_map(df: pd.DataFrame) -> Dict[str, Dict[str, Optional[str]]]:

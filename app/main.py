@@ -6,7 +6,12 @@ import os
 from contextlib import asynccontextmanager
 
 from app.api.v1.router import api_router
-from app.dependencies import get_search_engine, init_search_engine, init_image_refresh_service
+from app.dependencies import (
+    get_search_engine,
+    init_search_engine,
+    init_text_search_engine,
+    init_image_refresh_service,
+)
 from app.config import settings
 
 
@@ -21,6 +26,11 @@ async def lifespan(app: FastAPI):
         print("⚠️  Database not found. You'll need to upload data first.")
     else:
         print("✅ Search engine initialized successfully")
+
+    if not init_text_search_engine():
+        print("⚠️  Text search engine not initialized.")
+    else:
+        print("✅ Text search engine ready")
     
     # Initialize image refresh service
     init_image_refresh_service()

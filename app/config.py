@@ -14,7 +14,8 @@ class Settings(BaseSettings):
     
     # Database settings
     DB_PATH: Optional[str] = None
-    TABLE_NAME: str = "influencer_profiles"
+    TEXT_DB_PATH: Optional[str] = None
+    TABLE_NAME: str = "influencer_facets"
     
     # API settings
     API_V1_PREFIX: str = "/api/v1"
@@ -50,9 +51,35 @@ class Settings(BaseSettings):
 # Global settings instance
 settings = Settings()
 
-# Set default DB path if not provided
-if not settings.DB_PATH:
+def _resolve_default_db_path() -> str:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(os.path.dirname(current_dir))
-    # Use the new vector database path
-    settings.DB_PATH = os.path.join(project_root, "DIME-AI-DB", "influencers_vectordb")
+    primary_path = os.path.join(
+        project_root,
+        "DIME-AI-DB",
+        "data",
+        "lancedb",
+    )
+    legacy_path = os.path.join(project_root, "DIME-AI-DB", "influencers_vectordb")
+    return primary_path if os.path.exists(primary_path) else legacy_path
+
+
+def _resolve_default_text_db_path() -> str:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(current_dir))
+    primary_path = os.path.join(
+        project_root,
+        "DIME-AI-DB",
+        "data",
+        "lancedb",
+    )
+    legacy_path = os.path.join(project_root, "DIME-AI-DB", "influencers_lancedb")
+    return primary_path if os.path.exists(primary_path) else legacy_path
+
+
+# Set default DB path if not provided
+if not settings.DB_PATH:
+    settings.DB_PATH = _resolve_default_db_path()
+
+if not settings.TEXT_DB_PATH:
+    settings.TEXT_DB_PATH = _resolve_default_text_db_path()

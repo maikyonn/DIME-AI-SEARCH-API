@@ -1,7 +1,11 @@
-"""Search API endpoints"""
+"""Simplified Search API endpoints."""
 import json
-from typing import List, Dict, Any
-from fastapi import APIRouter, HTTPException, Depends
+import logging
+import threading
+from queue import SimpleQueue
+from typing import Any, Dict, List
+
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.dependencies import get_search_engine
@@ -9,95 +13,109 @@ from app.models.search import (
     SearchRequest,
     SimilarSearchRequest,
     CategorySearchRequest,
+    EvaluationRequest,
     SearchResponse,
-    ProfileFitTestRequest,
+    EvaluationResponse,
+    UsernameSearchResponse,
 )
-from app.models.creator import SearchResult
-
 
 router = APIRouter()
 
-
-def format_number(num: int) -> str:
-    """Format numbers for display (e.g., 1.2K, 1.5M)"""
-    if num >= 1_000_000:
-        return f"{num/1_000_000:.1f}M"
-    elif num >= 1_000:
-        return f"{num/1_000:.1f}K"
-    else:
-        return str(int(num))
+logger = logging.getLogger("search_api")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("[SearchAPI] %(asctime)s %(levelname)s: %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 
-def format_engagement_rate(rate: float) -> float:
-    """Convert engagement rate from decimal to percentage (multiply by 100) with full precision"""
+def _format_number(value: int) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return str(int(value))
+
+
+def _format_engagement(rate: float) -> float:
     return rate * 100 if rate is not None else 0.0
 
 
-def parse_json_field(json_str: str) -> List[Any]:
-    """Parse JSON fields and extract meaningful content"""
-    if not json_str or json_str == '':
+def _parse_posts(raw_posts: Any) -> List[Any]:
+    if not raw_posts:
         return []
-    
-    try:
-        data = json.loads(json_str)
-        if isinstance(data, list):
-            return data[:3]  # Show first 3 items
-        elif isinstance(data, dict):
-            return [data]
-        return []
-    except (json.JSONDecodeError, TypeError):
-        return []
+    if isinstance(raw_posts, list):
+        return raw_posts[:3]
+    if isinstance(raw_posts, dict):
+        return [raw_posts]
+    return []
 
 
 def result_to_dict(result) -> Dict[str, Any]:
-    """Convert SearchResult to dictionary for JSON serialization with original database column names"""
+    platform = getattr(result, "platform", None)
+    platform_normalized = platform.lower() if isinstance(platform, str) else None
+    profile_image = getattr(result, "profile_image_link", "") or getattr(
+        result, "profile_image_url", ""
+    )
+
+    account_value = getattr(result, "account", "")
+    profile_url = getattr(result, "profile_url", "") or getattr(result, "url", "")
+    if not profile_url and account_value:
+        if platform_normalized == "tiktok":
+            profile_url = f"https://www.tiktok.com/@{account_value}"
+        else:
+            profile_url = f"https://instagram.com/{account_value}"
+
     return {
-        'id': result.id,
-        'account': result.account,
-        'profile_name': result.profile_name,
-        'followers': result.followers,
-        'followers_formatted': format_number(result.followers),
-        'avg_engagement': format_engagement_rate(result.avg_engagement),
-        'avg_engagement_raw': result.avg_engagement,  # Keep raw value for advanced filtering
-        'business_category_name': result.business_category_name,
-        'business_address': result.business_address,
-        'biography': result.biography,
-        'profile_image_link': getattr(result, 'profile_image_link', ''),
-        'profile_url': getattr(result, 'profile_url', ''),
-        'business_email': getattr(result, 'business_email', ''),
-        'email_address': getattr(result, 'email_address', ''),
-        'posts': parse_json_field(getattr(result, 'posts', '')),
-        'is_personal_creator': getattr(result, 'is_personal_creator', True),
-        # Original database LLM score columns
-        'individual_vs_org_score': getattr(result, 'individual_vs_org_score', 0),
-        'generational_appeal_score': getattr(result, 'generational_appeal_score', 0),
-        'professionalization_score': getattr(result, 'professionalization_score', 0),
-        'relationship_status_score': getattr(result, 'relationship_status_score', 0),
-        # Vector search similarity scores (text-based search)
-        'keyword_score': getattr(result, 'keyword_score', 0.0),
-        'profile_score': getattr(result, 'profile_score', 0.0),
-        'content_score': getattr(result, 'content_score', 0.0),
-        'combined_score': getattr(result, 'combined_score', 0.0),
-        # Vector similarity scores (direct vector comparison)
-        'keyword_similarity': getattr(result, 'keyword_similarity', 0.0),
-        'profile_similarity': getattr(result, 'profile_similarity', 0.0),
-        'content_similarity': getattr(result, 'content_similarity', 0.0),
-        'vector_similarity_score': getattr(result, 'vector_similarity_score', 0.0),
-        'similarity_explanation': getattr(result, 'similarity_explanation', ''),
-        'fit_score': getattr(result, 'fit_score', None),
-        'fit_rationale': getattr(result, 'fit_rationale', None),
-        'fit_error': getattr(result, 'fit_error', None),
-        'fit_prompt': getattr(result, 'fit_prompt', None),
-        'fit_raw_response': getattr(result, 'fit_raw_response', None),
+        "id": result.id,
+        "lance_db_id": getattr(result, "lance_db_id", None),
+        "account": account_value,
+        "username": getattr(result, "username", account_value),
+        "display_name": getattr(result, "display_name", result.profile_name),
+        "profile_name": result.profile_name,
+        "platform": platform_normalized,
+        "platform_id": getattr(result, "platform_id", None),
+        "followers": result.followers,
+        "followers_formatted": _format_number(result.followers),
+        "avg_engagement": _format_engagement(result.avg_engagement),
+        "avg_engagement_raw": result.avg_engagement,
+        "business_category_name": result.business_category_name,
+        "business_address": result.business_address,
+        "biography": result.biography,
+        "profile_image_link": profile_image,
+        "profile_image_url": profile_image,
+        "profile_url": profile_url,
+        "business_email": getattr(result, "business_email", ""),
+        "email_address": getattr(result, "email_address", ""),
+        "posts": _parse_posts(getattr(result, "posts_raw", "")),
+        "is_personal_creator": getattr(result, "is_personal_creator", True),
+        "individual_vs_org_score": getattr(result, "individual_vs_org_score", 0),
+        "generational_appeal_score": getattr(result, "generational_appeal_score", 0),
+        "professionalization_score": getattr(result, "professionalization_score", 0),
+        "relationship_status_score": getattr(result, "relationship_status_score", 0),
+        "bm25_fts_score": getattr(result, "bm25_fts_score", None),
+        "cos_sim_profile": getattr(result, "cos_sim_profile", None),
+        "cos_sim_posts": getattr(result, "cos_sim_posts", None),
+        "combined_score": getattr(result, "combined_score", 0.0),
+        "keyword_similarity": getattr(result, "keyword_similarity", None),
+        "profile_similarity": getattr(result, "profile_similarity", None),
+        "content_similarity": getattr(result, "content_similarity", None),
+        "vector_similarity_score": getattr(result, "vector_similarity_score", None),
+        "profile_fts_source": getattr(result, "profile_fts_source", None),
+        "posts_fts_source": getattr(result, "posts_fts_source", None),
+        "score_mode": getattr(result, "score_mode", "hybrid"),
+        "similarity_explanation": getattr(result, "similarity_explanation", ""),
+        "fit_score": getattr(result, "fit_score", None),
+        "fit_rationale": getattr(result, "fit_rationale", None),
+        "fit_error": getattr(result, "fit_error", None),
+        "fit_prompt": getattr(result, "fit_prompt", None),
+        "fit_raw_response": getattr(result, "fit_raw_response", None),
     }
 
 
-@router.get("/username/{username}")
-async def get_creator_by_username(
-    username: str,
-    search_engine=Depends(get_search_engine)
-):
-    """Retrieve a single creator profile by exact username."""
+@router.get("/username/{username}", response_model=UsernameSearchResponse)
+async def get_creator_by_username(username: str, search_engine=Depends(get_search_engine)):
     sanitized = username.strip()
     if not sanitized:
         raise HTTPException(status_code=400, detail="Username is required")
@@ -105,370 +123,60 @@ async def get_creator_by_username(
     try:
         result = search_engine.get_creator_by_username(sanitized)
         if not result:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Creator '@{sanitized}' not found"
-            )
-
-        return {
-            'success': True,
-            'result': result_to_dict(result)
-        }
-
+            raise HTTPException(status_code=404, detail=f"Creator '@{sanitized}' not found")
+        return {"success": True, "result": result_to_dict(result)}
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Username lookup failed: {str(e)}"
-        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Username lookup failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Username lookup failed") from exc
 
 
 @router.post("/", response_model=SearchResponse)
-async def search_creators(
-    request: SearchRequest,
-    search_engine=Depends(get_search_engine)
-):
-    """
-    Search for creators/influencers based on business description or query
-    
-    This endpoint supports both business description matching and general search.
-    It automatically detects the query type or you can specify it explicitly.
-    """
+async def search_creators(request: SearchRequest, search_engine=Depends(get_search_engine)):
+    logger.info(
+        "Search request | method=%s limit=%s query=%s",
+        request.method,
+        request.limit,
+        request.query,
+    )
+
     try:
-        # Prepare custom weights if provided
-        custom_weights = None
-        if request.custom_weights:
-            custom_weights = {
-                'keyword': request.custom_weights.keyword,
-                'profile': request.custom_weights.profile,
-                'content': request.custom_weights.content
-            }
-
-        vector_query = request.vector_query or request.query
-        business_query = request.business_query or request.business_fit_query
-
-        # Use vector search with full customization
-        results, debug_payload = search_engine.search_creators_for_campaign(
-            query=vector_query,
+        results = search_engine.search_creators_for_campaign(
+            query=request.query,
             method=request.method,
             limit=request.limit,
             min_followers=request.min_followers,
             max_followers=request.max_followers,
             min_engagement=request.min_engagement,
             max_engagement=request.max_engagement,
-            location_filter=request.location,
-            target_category=request.category,
-            relevance_keywords=request.keywords,
-            custom_weights=custom_weights,
-            similarity_threshold=request.similarity_threshold,
-            return_vectors=request.return_vectors,
-            business_fit_query=business_query,
-            post_filter_limit=request.post_filter_limit,
-            post_filter_concurrency=request.post_filter_concurrency or 8,
-            post_filter_max_posts=request.post_filter_max_posts or 6,
-            post_filter_model=request.post_filter_model or "gpt-5-mini",
-            post_filter_verbosity=request.post_filter_verbosity or "medium",
-            post_filter_use_brightdata=request.post_filter_use_brightdata or False,
-            return_debug=True,
-            # Account Type Filters
+            location=request.location,
+            category=request.category,
             is_verified=request.is_verified,
             is_business_account=request.is_business_account,
-            # LLM Score Filters
-            min_individual_vs_org_score=request.min_individual_vs_org_score,
-            max_individual_vs_org_score=request.max_individual_vs_org_score,
-            min_generational_appeal_score=request.min_generational_appeal_score,
-            max_generational_appeal_score=request.max_generational_appeal_score,
-            min_professionalization_score=request.min_professionalization_score,
-            max_professionalization_score=request.max_professionalization_score,
-            min_relationship_status_score=request.min_relationship_status_score,
-            max_relationship_status_score=request.max_relationship_status_score,
-            # Content Stats Filters
-            min_posts_count=request.min_posts_count,
-            max_posts_count=request.max_posts_count,
-            min_following=request.min_following,
-            max_following=request.max_following
+            lexical_scope=request.lexical_scope,
         )
-        
-        # Convert results to dictionaries
-        results_data = [result_to_dict(result) for result in results]
-        
-        debug_payload['vector_query'] = vector_query
-        debug_payload['business_query'] = business_query
-
-        return SearchResponse(
-            success=True,
-            results=results_data,
-            count=len(results_data),
-            query=vector_query,
-            business_query=business_query,
-            method=request.method,
-            debug=debug_payload
-        )
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Search failed: {str(e)}"
-        )
-
-
-@router.post("/stream")
-async def search_creators_stream(
-    request: SearchRequest,
-    search_engine=Depends(get_search_engine)
-):
-    """Stream stage-by-stage search progress using Server-Sent Events."""
-    vector_query = request.vector_query or request.query
-    business_query = request.business_query or request.business_fit_query
-
-    def event_stream():
-        import json
-        from app.core.search_engine import SearchWeights
-        from app.core.post_filter.profile_fit import ProfileFitAssessor
-        from app.core.post_filter.profile_fit import _parse_posts
-        from app.api.v1.search import result_to_dict
-        from app.config import settings
-
-        def sse_event(stage: str, payload: Dict[str, Any]) -> str:
-            return f"data: {json.dumps({'stage': stage, 'data': payload})}\n\n"
-
-        try:
-            enhanced_query = vector_query
-            if request.keywords:
-                enhanced_query += " " + " ".join(request.keywords)
-            if request.category and request.category in search_engine.content_categories:
-                category_keywords = " ".join(search_engine.content_categories[request.category][:5])
-                enhanced_query += " " + category_keywords
-
-            custom_weights = None
-            if request.custom_weights:
-                custom_weights = SearchWeights(
-                    keyword=request.custom_weights.keyword,
-                    profile=request.custom_weights.profile,
-                    content=request.custom_weights.content
-                )
-
-            weights = custom_weights
-            if weights is None and request.method in {"keyword", "profile", "content"}:
-                if request.method == "keyword":
-                    weights = SearchWeights(keyword=0.7, profile=0.2, content=0.1)
-                elif request.method == "profile":
-                    weights = SearchWeights(keyword=0.3, profile=0.6, content=0.1)
-                elif request.method == "content":
-                    weights = SearchWeights(keyword=0.2, profile=0.3, content=0.5)
-
-            filters: Dict[str, Any] = {}
-            if request.max_followers is not None:
-                filters['followers'] = (int(request.min_followers), int(request.max_followers))
-            elif request.min_followers > 0:
-                filters['followers'] = (int(request.min_followers), 100000000)
-
-            if request.min_engagement is not None or request.max_engagement is not None:
-                min_eng = float(request.min_engagement) if request.min_engagement is not None else 0.0
-                max_eng = float(request.max_engagement) if request.max_engagement is not None else 1.0
-                if min_eng > 0 or max_eng < 1.0:
-                    filters['engagement_rate'] = (min_eng, max_eng)
-
-            if request.is_verified is not None:
-                filters['is_verified'] = request.is_verified
-            if request.is_business_account is not None:
-                filters['is_business_account'] = request.is_business_account
-
-            # score filters
-            score_fields = [
-                ('individual_vs_org_score', request.min_individual_vs_org_score, request.max_individual_vs_org_score),
-                ('generational_appeal_score', request.min_generational_appeal_score, request.max_generational_appeal_score),
-                ('professionalization_score', request.min_professionalization_score, request.max_professionalization_score),
-                ('relationship_status_score', request.min_relationship_status_score, request.max_relationship_status_score),
-            ]
-            for field, min_val, max_val in score_fields:
-                if min_val is not None and max_val is not None:
-                    filters[field] = (int(min_val), int(max_val))
-                elif min_val is not None:
-                    filters[field] = (int(min_val), 10)
-                elif max_val is not None:
-                    filters[field] = (0, int(max_val))
-
-            if request.min_posts_count is not None or request.max_posts_count is not None:
-                min_posts = int(request.min_posts_count) if request.min_posts_count is not None else 0
-                max_posts = int(request.max_posts_count) if request.max_posts_count is not None else 100000
-                filters['posts_count'] = (min_posts, max_posts)
-
-            if request.min_following is not None or request.max_following is not None:
-                min_following = int(request.min_following) if request.min_following is not None else 0
-                max_following = int(request.max_following) if request.max_following is not None else 100000000
-                filters['following'] = (min_following, max_following)
-
-            results_df = search_engine.engine.search(
-                query=enhanced_query,
-                limit=request.limit,
-                weights=weights,
-                filters=filters if filters else None
-            )
-
-            search_results = [search_engine._convert_to_search_result(row) for _, row in results_df.iterrows()]
-
-            vector_payload = {
-                "query": vector_query,
-                "count": len(search_results),
-                "results": [result_to_dict(r) for r in search_results],
-            }
-            yield sse_event("vector_results", vector_payload)
-
-            debug_payload = {
-                "vector_results": json.loads(results_df.to_json(orient="records")),
-                "brightdata_results": [],
-                "profile_fit": [],
-                "vector_query": vector_query,
-                "business_query": business_query,
-            }
-
-            if business_query:
-                subset = search_results[: request.post_filter_limit or len(search_results)]
-                brightdata_records: List[Dict[str, Any]] = []
-
-                if request.post_filter_use_brightdata:
-                    yield sse_event("brightdata_started", {"count": len(subset)})
-                    try:
-                        brightdata_records = search_engine._refresh_profiles_with_brightdata(subset)
-                        debug_payload["brightdata_results"] = brightdata_records
-                        yield sse_event("brightdata_results", {"records": brightdata_records})
-                    except Exception as exc:  # pylint: disable=broad-except
-                        yield sse_event("brightdata_error", {"message": str(exc)})
-
-                assessor = ProfileFitAssessor(
-                    business_query=business_query,
-                    model=request.post_filter_model or "gpt-5-mini",
-                    verbosity=request.post_filter_verbosity or "medium",
-                    max_posts=request.post_filter_max_posts or 6,
-                    concurrency=1,
-                    openai_api_key=settings.OPENAI_API_KEY,
-                )
-
-                documents = []
-                for item in subset:
-                    doc = {
-                        "account": item.account,
-                        "profile_url": item.profile_url or (f"https://instagram.com/{item.account}" if item.account else None),
-                        "followers": item.followers,
-                        "biography": item.biography,
-                        "profile_name": item.profile_name,
-                        "business_category_name": item.business_category_name,
-                        "category_name": item.business_category_name,
-                        "is_verified": item.is_verified,
-                        "posts": item.posts_raw,
-                    }
-                    doc["parsed_posts"] = _parse_posts(doc.get("posts"), max_posts=assessor.max_posts)
-                    documents.append(doc)
-
-                total = len(documents)
-                yield sse_event("profile_fit_started", {"total": total})
-
-                profile_fit_debug = []
-                for idx, (item, doc) in enumerate(zip(subset, documents), start=1):
-                    fit_result = assessor._score_profile(doc)
-                    item.fit_score = fit_result.score
-                    item.fit_rationale = fit_result.rationale
-                    item.fit_error = fit_result.error
-                    item.fit_prompt = fit_result.prompt
-                    item.fit_raw_response = fit_result.raw_response
-
-                    result_dict = result_to_dict(item)
-                    event_payload = {
-                        "index": idx,
-                        "total": total,
-                        "result": result_dict,
-                    }
-                    yield sse_event("profile_fit_result", event_payload)
-
-                    profile_fit_debug.append(
-                        {
-                            "account": fit_result.account,
-                            "profile_url": fit_result.profile_url,
-                            "followers": fit_result.followers,
-                            "score": fit_result.score,
-                            "rationale": fit_result.rationale,
-                            "error": fit_result.error,
-                            "prompt": fit_result.prompt,
-                            "raw_response": fit_result.raw_response,
-                        }
-                    )
-
-                yield sse_event("profile_fit_completed", {"total": total})
-                debug_payload["profile_fit"] = profile_fit_debug
-
-            final_results = [result_to_dict(r) for r in search_results]
-            yield sse_event("done", {"results": final_results, "debug": debug_payload})
-
-        except Exception as exc:  # pylint: disable=broad-except
-            yield sse_event("error", {"message": str(exc)})
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-@router.post("/profile-fit/test")
-async def profile_fit_test(
-    request: ProfileFitTestRequest,
-    search_engine=Depends(get_search_engine)
-):
-    """Run stage-two profile fit scoring on a single influencer."""
-    if not request.account and not request.profile_url:
-        raise HTTPException(status_code=400, detail="Either account or profile_url must be provided")
-
-    try:
-        result = search_engine.run_profile_fit_preview(
-            business_fit_query=request.business_fit_query,
-            account=request.account,
-            profile_url=request.profile_url,
-            max_posts=request.max_posts,
-            model=request.model,
-            verbosity=request.verbosity,
-            use_brightdata=request.use_brightdata,
-            concurrency=request.concurrency,
-        )
-
-        return {
-            'success': True,
-            'result': {
-                'account': result.account,
-                'profile_url': result.profile_url,
-                'followers': result.followers,
-                'score': result.score,
-                'rationale': result.rationale,
-                'error': result.error,
-                'prompt': result.prompt,
-                'raw_response': result.raw_response,
-            }
-        }
-
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pylint: disable=broad-except
-        raise HTTPException(status_code=500, detail=f"Profile fit test failed: {exc}") from exc
+        logger.exception("Search failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Search failed") from exc
+
+    payload = [result_to_dict(result) for result in results]
+    return SearchResponse(
+        success=True,
+        results=payload,
+        count=len(payload),
+        query=request.query,
+        method=request.method,
+    )
 
 
 @router.post("/similar", response_model=SearchResponse)
-async def find_similar_creators(
-    request: SimilarSearchRequest,
-    search_engine=Depends(get_search_engine)
-):
-    """
-    Find creators similar to a reference account
-    
-    This endpoint finds creators with similar characteristics, engagement patterns,
-    and audience demographics to the specified reference account.
-    """
+async def similar_creators(request: SimilarSearchRequest, search_engine=Depends(get_search_engine)):
+    logger.info("Similar search | account=%s limit=%s", request.account, request.limit)
+
     try:
-        # Prepare custom weights if provided
-        custom_weights = None
-        if request.custom_weights:
-            custom_weights = {
-                'keyword': request.custom_weights.keyword,
-                'profile': request.custom_weights.profile,
-                'content': request.custom_weights.content
-            }
-        
         results = search_engine.find_similar_creators(
             reference_account=request.account,
             limit=request.limit,
@@ -476,50 +184,35 @@ async def find_similar_creators(
             max_followers=request.max_followers,
             min_engagement=request.min_engagement,
             max_engagement=request.max_engagement,
-            location_filter=request.location,
-            target_category=request.category,
-            similarity_threshold=request.similarity_threshold,
-            use_vector_similarity=request.use_vector_similarity,
-            custom_weights=custom_weights
+            location=request.location,
+            category=request.category,
         )
-        
-        results_data = [result_to_dict(result) for result in results]
-        
-        return SearchResponse(
-            success=True,
-            results=results_data,
-            count=len(results_data),
-            query=f"Similar to @{request.account}",
-            method="similarity"
-        )
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Similar search failed: {str(e)}"
-        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Similar search failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Similar search failed") from exc
+
+    payload = [result_to_dict(result) for result in results]
+    return SearchResponse(
+        success=True,
+        results=payload,
+        count=len(payload),
+        query=request.account,
+        method="similar",
+    )
 
 
 @router.post("/category", response_model=SearchResponse)
-async def search_by_category(
-    request: CategorySearchRequest,
-    search_engine=Depends(get_search_engine)
-):
-    """
-    Search creators by business category
-    
-    This endpoint searches for creators within a specific business category,
-    optionally filtered by location.
-    """
-    try:
-        custom_weights = None
-        if request.custom_weights:
-            custom_weights = {
-                'keyword': request.custom_weights.keyword,
-                'profile': request.custom_weights.profile,
-                'content': request.custom_weights.content
-            }
+async def category_search(request: CategorySearchRequest, search_engine=Depends(get_search_engine)):
+    logger.info(
+        "Category search | category=%s location=%s limit=%s",
+        request.category,
+        request.location,
+        request.limit,
+    )
 
+    try:
         results = search_engine.search_by_category(
             category=request.category,
             location=request.location,
@@ -528,22 +221,118 @@ async def search_by_category(
             max_followers=request.max_followers,
             min_engagement=request.min_engagement,
             max_engagement=request.max_engagement,
-            custom_weights=custom_weights,
-            similarity_threshold=request.similarity_threshold
         )
-        
-        results_data = [result_to_dict(result) for result in results]
-        
-        return SearchResponse(
-            success=True,
-            results=results_data,
-            count=len(results_data),
-            query=f"Category: {request.category}" + (f" in {request.location}" if request.location else ""),
-            method="category"
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Category search failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Category search failed") from exc
+
+    payload = [result_to_dict(result) for result in results]
+    return SearchResponse(
+        success=True,
+        results=payload,
+        count=len(payload),
+        query=request.category,
+        method="category",
+    )
+
+
+@router.post("/evaluate", response_model=EvaluationResponse)
+async def evaluate_profiles(request: EvaluationRequest, search_engine=Depends(get_search_engine)):
+    logger.info(
+        "Evaluate profiles | brightdata=%s llm=%s count=%s",
+        request.run_brightdata,
+        request.run_llm,
+        len(request.profiles),
+    )
+
+    try:
+        results, debug = search_engine.evaluate_profiles(
+            request.profiles,
+            business_fit_query=request.business_fit_query,
+            run_brightdata=request.run_brightdata,
+            run_llm=request.run_llm,
+            max_profiles=request.max_profiles,
+            max_posts=request.max_posts,
+            model=request.model,
+            verbosity=request.verbosity,
+            concurrency=request.concurrency,
         )
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Category search failed: {str(e)}"
-        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Profile evaluation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Profile evaluation failed") from exc
+
+    payload = [result_to_dict(result) for result in results]
+    return EvaluationResponse(
+        success=True,
+        results=payload,
+        brightdata_results=debug.get("brightdata_results", []),
+        profile_fit=debug.get("profile_fit", []),
+        count=len(payload),
+    )
+
+
+@router.post("/evaluate/stream")
+async def evaluate_profiles_stream(request: EvaluationRequest, search_engine=Depends(get_search_engine)):
+    logger.info(
+        "Evaluate profiles (stream) | brightdata=%s llm=%s count=%s",
+        request.run_brightdata,
+        request.run_llm,
+        len(request.profiles),
+    )
+
+    def sse_event(stage: str, data: Dict[str, Any]) -> str:
+        return f"data: {json.dumps({'stage': stage, 'data': data})}\n\n"
+
+    def event_stream():
+        queue: "SimpleQueue[Optional[Dict[str, Any]]]" = SimpleQueue()
+
+        def progress(stage: str, data: Dict[str, Any]) -> None:
+            queue.put({"stage": stage, "data": data})
+
+        def worker() -> None:
+            try:
+                results, debug = search_engine.evaluate_profiles(
+                    request.profiles,
+                    business_fit_query=request.business_fit_query,
+                    run_brightdata=request.run_brightdata,
+                    run_llm=request.run_llm,
+                    max_profiles=request.max_profiles,
+                    max_posts=request.max_posts,
+                    model=request.model,
+                    verbosity=request.verbosity,
+                    concurrency=request.concurrency,
+                    progress_cb=progress,
+                )
+                payload = [result_to_dict(result) for result in results]
+                queue.put(
+                    {
+                        "stage": "completed",
+                        "data": {
+                            "results": payload,
+                            "brightdata_results": debug.get("brightdata_results", []),
+                            "profile_fit": debug.get("profile_fit", []),
+                            "count": len(payload),
+                        },
+                    }
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("Streaming evaluation failed: %s", exc)
+                queue.put({"stage": "error", "data": {"message": str(exc)}})
+            finally:
+                queue.put(None)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            item = queue.get()
+            if item is None:
+                break
+            yield sse_event(item["stage"], item["data"])
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
