@@ -12,20 +12,18 @@ from typing import List, Optional
 import lancedb
 import pandas as pd
 
+from app.config import settings, _resolve_default_db_path
+
 
 def connect_to_database(db_path: str = None) -> lancedb.DBConnection:
     """Connect to the LanceDB database"""
     if not db_path:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(current_dir)
-        combined_path = os.path.join(
-            project_root,
-            "DIME-AI-DB",
-            "data",
-            "lancedb",
-        )
-        legacy_path = os.path.join(project_root, "DIME-AI-DB", "influencers_vectordb")
-        db_path = combined_path if os.path.exists(combined_path) else legacy_path
+        db_path = settings.DB_PATH or _resolve_default_db_path()
+
+    if not os.path.exists(db_path):
+        fallback_path = _resolve_default_db_path()
+        if fallback_path and fallback_path != db_path:
+            db_path = fallback_path
     
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database not found at: {db_path}")

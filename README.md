@@ -25,8 +25,7 @@ fastapi_backend/
 │   ├── api/v1/                # API endpoints
 │   │   ├── router.py          # Main API router
 │   │   ├── search.py          # Search endpoints
-│   │   ├── creators.py        # Creator endpoints
-│   │   └── images.py          # Image management endpoints
+│   │   └── (see DIME-AI-BD for image refresh endpoints)
 │   │
 │   ├── core/                  # Core business logic
 │   │   └── search_engine.py   # Search engine wrapper
@@ -51,8 +50,9 @@ fastapi_backend/
 ### Prerequisites
 
 - Python 3.8+
-- Access to the existing LanceDB database (influencers_lancedb)
-- (Optional) Bright Data API token for image refresh functionality
+- Access to the `DIME-AI-DB` repository containing the LanceDB dataset (`data/lancedb`)
+- DeepInfra API key (for semantic / hybrid search modes)
+- Running instance of the `DIME-AI-BD` BrightData service (Redis + worker) for image refresh functionality
 
 ### Installation
 
@@ -76,8 +76,8 @@ fastapi_backend/
    ```
 
 5. **Ensure database access**
-   - The API expects the LanceDB database at `../influencers_lancedb` relative to the project root
-   - Or set `DB_PATH` in your `.env` file to point to the correct location
+   - Place `DIME-AI-DB` alongside this repo (recommended) so the API can auto-detect `../DIME-AI-DB/data/lancedb`
+   - Alternatively, set `DB_PATH` (or `DIME_AI_DB_ROOT`) in your `.env` file to point to the correct LanceDB directory
 
 ### Configuration
 
@@ -87,15 +87,29 @@ Edit `.env` file with your settings:
 # Set to true for development
 DEBUG=true
 
-# Path to LanceDB database (optional - defaults to ../influencers_lancedb)
-DB_PATH=/path/to/your/influencers_lancedb
+# API port (default: 7001)
+PORT=7001
 
-# Bright Data API token for image refresh (optional)
-BRIGHTDATA_API_TOKEN=your_token_here
+# Path to LanceDB database (optional - defaults to ../DIME-AI-DB/data/lancedb)
+DB_PATH=/path/to/DIME-AI-DB/data/lancedb
+
+# DeepInfra embeddings (required for semantic/hybrid search)
+DEEPINFRA_API_KEY=your_deepinfra_key
+DEEPINFRA_ENDPOINT=https://api.deepinfra.com/v1/openai
+EMBED_MODEL=google/embeddinggemma-300m
+
+# BrightData microservice (DIME-AI-BD)
+BRIGHTDATA_SERVICE_URL=http://localhost:7100/brightdata/images
+BRIGHTDATA_JOB_TIMEOUT=600
+BRIGHTDATA_JOB_POLL_INTERVAL=5
 
 # CORS origins (comma-separated)
 ALLOWED_ORIGINS=http://localhost:3000,https://yourdomain.com
 ```
+
+The application and `start.sh` script default to port `7001` and automatically read the `PORT` value from `.env` (or the shell environment) if you need to change it.
+
+> **Note:** The BrightData endpoints now proxy through the standalone `DIME-AI-BD` service. Ensure Redis is running and at least one RQ worker from that repo is active before using image refresh or profile evaluation features.
 
 ## 🚀 Running the Application
 
@@ -103,14 +117,14 @@ ALLOWED_ORIGINS=http://localhost:3000,https://yourdomain.com
 
 ```bash
 # Start with auto-reload
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 7001 --reload
 ```
 
 ### Production Server
 
 ```bash
 # Start production server
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+uvicorn app.main:app --host 0.0.0.0 --port 7001 --workers 4
 ```
 
 ### Alternative: Direct Python
@@ -125,8 +139,11 @@ python -m app.main
 
 Once running, visit:
 
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
+- **Swagger UI**: http://localhost:7001/docs
+- **ReDoc**: http://localhost:7001/redoc
+- **Production (pen.optimat.us)**: http://pen.optimat.us:7001/docs
+
+> **API root**: application routes are served under `/search` (for example `POST /search/`, `POST /search/similar`).
 
 ### Comprehensive Documentation
 
@@ -144,15 +161,12 @@ See [docs/api.md](docs/api.md) for detailed API documentation including:
 - `GET /` - API information
 
 ### Search
-- `POST /api/v1/search/` - Main creator search
-- `POST /api/v1/search/similar` - Find similar creators
-- `POST /api/v1/search/category` - Category-based search
+- `POST /search/` - Main creator search
+- `POST /search/similar` - Find similar creators
+- `POST /search/category` - Category-based search
 
 ### Image Management
-- `POST /api/v1/images/refresh` - Refresh profile images
-- `POST /api/v1/images/refresh/search-results` - Refresh from search results
-- `GET /api/v1/images/refresh/status` - Service status
-- `GET /api/v1/images/proxy` - Image proxy (CORS bypass)
+- BrightData image refresh/proxy endpoints now live in the `DIME-AI-BD` service (`/brightdata/images/...`).
 
 ## 🔍 Usage Examples
 
@@ -160,7 +174,7 @@ See [docs/api.md](docs/api.md) for detailed API documentation including:
 ```python
 import requests
 
-response = requests.post('http://localhost:8000/api/v1/search/', json={
+response = requests.post('http://localhost:7001/search/', json={
     "query": "sustainable fashion brand targeting Gen Z",
     "limit": 10,
     "min_followers": 5000
@@ -171,7 +185,7 @@ results = response.json()
 
 ### Custom Weighted Search
 ```python
-response = requests.post('http://localhost:8000/api/v1/search/', json={
+response = requests.post('http://localhost:7001/search/', json={
     "query": "tech startup focusing on mobile apps",
     "method": "hybrid",
     "limit": 20,
@@ -187,7 +201,7 @@ response = requests.post('http://localhost:8000/api/v1/search/', json={
 
 ### Find Similar Creators
 ```python
-response = requests.post('http://localhost:8000/api/v1/search/similar', json={
+response = requests.post('http://localhost:7001/search/similar', json={
     "account": "reference_username",
     "limit": 15,
     "min_followers": 10000
@@ -199,11 +213,12 @@ response = requests.post('http://localhost:8000/api/v1/search/similar', json={
 If you're migrating from the Flask version:
 
 1. **URL Changes**:
-   - Base URL: `localhost:5001` → `localhost:8000`
-   - Add `/api/v1` prefix to endpoints
-   - `/search` → `/api/v1/search/`
-   - `/similar` → `/api/v1/search/similar`
-   - `/category` → `/api/v1/search/category`
+   - Base URL: `localhost:5001` → `localhost:7001`
+   - New base path: `/search`
+   - `/search` endpoint remains `POST /search/`
+   - `/similar` → `/search/similar`
+   - `/category` → `/search/category`
+   - Image refresh routes are served from `DIME-AI-BD`.
 
 2. **Request Format**: Now uses Pydantic models for validation
 3. **Response Format**: Standardized with success/error fields

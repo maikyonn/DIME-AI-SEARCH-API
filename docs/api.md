@@ -2,16 +2,20 @@
 
 A FastAPI-based REST API for searching and managing GenZ creators/influencers with advanced matching algorithms and real-time image refresh capabilities.
 
-## Base URL
+## Base URLs
 
-```
-http://localhost:8000
-```
+- Local development: `http://localhost:7001`
+- Production (pen.optimat.us): `http://pen.optimat.us:7001`
 
 ## Interactive Documentation
 
-- **Swagger UI**: `http://localhost:8000/docs`
-- **ReDoc**: `http://localhost:8000/redoc`
+- **Swagger UI**: `http://localhost:7001/docs`
+- **ReDoc**: `http://localhost:7001/redoc`
+- **Production (pen.optimat.us)**: `http://pen.optimat.us:7001/docs`
+
+## API Root
+
+All JSON endpoints are served beneath the `/search` path (for example: `POST /search/`, `POST /search/similar`). Image refresh/proxy functionality has moved to the companion `DIME-AI-BD` service (`/brightdata/images/...`).
 
 ## Authentication
 
@@ -29,9 +33,13 @@ Check API health status
 {
   "status": "healthy",
   "database_available": true,
-  "timestamp": "2024-01-01T00:00:00Z"
+  "timestamp": "2024-07-15T12:34:56+00:00"
 }
 ```
+
+- `status`: `"healthy"` when all dependencies are available, `"degraded"` otherwise
+- `database_available`: `true` when the LanceDB instance is reachable
+- `timestamp`: ISO 8601 timestamp for when the check was processed
 
 ---
 
@@ -39,7 +47,7 @@ Check API health status
 
 ### Search Creators
 
-#### POST `/api/v1/search/`
+#### POST `/search/`
 Search for creators based on business description or query
 
 **Request Body:**
@@ -114,7 +122,7 @@ Search for creators based on business description or query
 
 ### Find Similar Creators
 
-#### POST `/api/v1/search/similar`
+#### POST `/search/similar`
 Find creators similar to a reference account
 
 **Request Body:**
@@ -133,7 +141,7 @@ Find creators similar to a reference account
 
 ### Search by Category
 
-#### POST `/api/v1/search/category`
+#### POST `/search/category`
 Search creators by business category
 
 **Request Body:**
@@ -156,96 +164,7 @@ Search creators by business category
 
 ## Image Management Endpoints
 
-### Refresh Images
-
-#### POST `/api/v1/images/refresh`
-Refresh profile images for specified users
-
-**Request Body:**
-```json
-{
-  "usernames": ["user1", "user2", "user3"],
-  "update_database": false
-}
-```
-
-**Parameters:**
-- `usernames` (array, required): List of usernames (1-50 items)
-- `update_database` (boolean): Whether to update database (default: false)
-
-**Response:**
-```json
-{
-  "success": true,
-  "results": [
-    {
-      "username": "user1",
-      "success": true,
-      "profile_image_url": "https://...",
-      "error": null
-    }
-  ],
-  "summary": {
-    "total": 3,
-    "successful": 2,
-    "failed": 1
-  },
-  "database_update": {
-    "status": "disabled - schema incompatible",
-    "message": "Database updates are currently disabled due to schema limitations"
-  }
-}
-```
-
-### Refresh Images from Search Results
-
-#### POST `/api/v1/images/refresh/search-results`
-Refresh images for users from search results
-
-**Request Body:**
-```json
-{
-  "search_results": [
-    {"account": "user1", "id": 123, ...},
-    {"account": "user2", "id": 456, ...}
-  ],
-  "update_database": true
-}
-```
-
-### Get Job Status
-
-#### GET `/api/v1/images/refresh/job/{snapshot_id}`
-Get status of a running image refresh job
-
-**Parameters:**
-- `snapshot_id` (string, required): Job snapshot ID
-
-### Get Service Status
-
-#### GET `/api/v1/images/refresh/status`
-Get image refresh service status
-
-**Response:**
-```json
-{
-  "service_available": true,
-  "api_token_configured": true,
-  "active_jobs": 2
-}
-```
-
-### Proxy Images
-
-#### GET `/api/v1/images/proxy`
-Proxy Instagram images to bypass CORS restrictions
-
-**Query Parameters:**
-- `url` (string, required): Instagram image URL to proxy
-
-**Response:** Streams the image with appropriate CORS headers
-
----
+Image refresh/proxy functionality now lives in the `DIME-AI-BD` service. Use its `/brightdata/images/...` routes for batch refreshes, job polling, SSE streams, and CDN proxies.
 
 ## Error Handling
 
@@ -322,15 +241,19 @@ Create a `.env` file in the project root:
 # API Configuration
 DEBUG=false
 
-# Database
-DB_PATH=/path/to/snap_data_lancedb
+# Database (defaults to ../DIME-AI-DB/data/lancedb when available)
+DB_PATH=/path/to/DIME-AI-DB/data/lancedb
 
-# Image Refresh Service
-BRIGHTDATA_API_TOKEN=your_brightdata_token_here
+# Image Refresh Service (DIME-AI-BD)
+BRIGHTDATA_SERVICE_URL=http://localhost:7100/brightdata/images
+BRIGHTDATA_JOB_TIMEOUT=600
+BRIGHTDATA_JOB_POLL_INTERVAL=5
 
 # CORS (comma-separated)
 ALLOWED_ORIGINS=http://localhost:3000,https://yourdomain.com
 ```
+
+Make sure the companion `DIME-AI-BD` service is running (including Redis + RQ worker) at the URL specified by `BRIGHTDATA_SERVICE_URL`.
 
 ---
 
@@ -368,14 +291,12 @@ Currently no rate limiting is implemented. Consider adding rate limiting for pro
 
 If migrating from the Flask version:
 
-1. Update base URL from `localhost:5001` to `localhost:8000`
-2. Add `/api/v1` prefix to all endpoints
-3. Update request/response format to match new schemas
-4. Replace `/search` with `/api/v1/search/`
-5. Replace `/similar` with `/api/v1/search/similar`
-6. Replace `/category` with `/api/v1/search/category`
-7. Replace `/api/refresh-images` with `/api/v1/images/refresh`
-8. Replace `/api/proxy-image` with `/api/v1/images/proxy`
+1. Update base URL from `localhost:5001` to `localhost:7001`
+2. Update request/response format to match new schemas
+3. Replace `/search` with `/search/`
+4. Replace `/similar` with `/search/similar`
+5. Replace `/category` with `/search/category`
+6. Update legacy `/api/refresh-images` or `/api/proxy-image` calls to point at `/brightdata/images/...` on the BrightData service.
 
 ---
 

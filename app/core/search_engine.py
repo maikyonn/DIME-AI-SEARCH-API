@@ -5,7 +5,7 @@ Provides higher-level orchestration for dense, lexical, and hybrid retrieval.
 import os
 import sys
 import json
-from typing import List, Optional, Dict, Any, Tuple, Callable
+from typing import List, Optional, Dict, Any, Tuple, Callable, Union
 from dataclasses import dataclass
 
 # Add the DIME-AI-DB src directory to path
@@ -78,6 +78,7 @@ class FastAPISearchEngine:
         self.engine = VectorSearchEngine(
             db_path=db_path,
             table_name=settings.TABLE_NAME or "influencer_facets",
+            model_name=settings.EMBED_MODEL,
         )
         
         # Content categories for campaign matching
@@ -194,6 +195,30 @@ class FastAPISearchEngine:
             fit_prompt=None,
             fit_raw_response=None
         )
+
+    def _coerce_search_result(self, payload: Union[SearchResult, Dict[str, Any]]) -> SearchResult:
+        """Accept either API payloads or in-process SearchResult instances."""
+        if isinstance(payload, SearchResult):
+            return payload
+        if isinstance(payload, dict):
+            return self._convert_to_search_result(payload)
+        raise TypeError(f"Unsupported profile payload type: {type(payload)!r}")
+
+    def _prepare_results(
+        self,
+        profiles: List[Union[SearchResult, Dict[str, Any]]],
+        max_profiles: Optional[int] = None,
+    ) -> List[SearchResult]:
+        if not profiles:
+            return []
+
+        all_results = [self._coerce_search_result(payload) for payload in profiles]
+        if max_profiles is None:
+            limit_count = len(all_results)
+        else:
+            limit_count = max(1, min(int(max_profiles), len(all_results)))
+
+        return all_results[:limit_count]
         
     def search_creators_for_campaign(
         self,
@@ -281,7 +306,7 @@ class FastAPISearchEngine:
 
     def evaluate_profiles(
         self,
-        profiles: List[Dict[str, Any]],
+        profiles: List[Union[SearchResult, Dict[str, Any]]],
         *,
         business_fit_query: Optional[str] = None,
         run_brightdata: bool = False,
@@ -295,16 +320,10 @@ class FastAPISearchEngine:
     ) -> Tuple[List[SearchResult], Dict[str, Any]]:
         """Run optional BrightData refresh and/or LLM scoring on a result set."""
 
-        if not profiles:
+        search_results = self._prepare_results(profiles, max_profiles)
+
+        if not search_results:
             return [], {"brightdata_results": [], "profile_fit": []}
-
-        if max_profiles is None:
-            limit_count = len(profiles)
-        else:
-            limit_count = max(1, min(int(max_profiles), len(profiles)))
-
-        limited_payloads = profiles[: limit_count]
-        search_results = [self._convert_to_search_result(payload) for payload in limited_payloads]
 
         debug: Dict[str, Any] = {
             "brightdata_results": [],
@@ -312,16 +331,19 @@ class FastAPISearchEngine:
         }
 
         if progress_cb:
-            progress_cb("evaluation_started", {"count": len(limited_payloads), "run_brightdata": run_brightdata, "run_llm": run_llm})
+            progress_cb(
+                "evaluation_started",
+                {"count": len(search_results), "run_brightdata": run_brightdata, "run_llm": run_llm},
+            )
 
         if run_llm:
             if not business_fit_query:
                 raise ValueError("business_fit_query is required when run_llm is True")
 
-            search_results, fit_debug = self._apply_profile_fit(
+            search_results, fit_debug = self.run_profile_fit_stage(
                 search_results,
                 business_fit_query=business_fit_query,
-                limit=len(search_results),
+                max_profiles=len(search_results),
                 concurrency=concurrency,
                 max_posts=max_posts,
                 model=model,
@@ -333,18 +355,76 @@ class FastAPISearchEngine:
             return search_results, debug
 
         if run_brightdata:
-            if progress_cb:
-                progress_cb("brightdata_started", {"count": len(search_results)})
-            try:
-                debug["brightdata_results"] = self._refresh_profiles_with_brightdata(search_results)
-            except Exception as exc:  # pylint: disable=broad-except
-                debug["brightdata_error"] = str(exc)
-            else:
-                if progress_cb:
-                    debug_count = len(debug["brightdata_results"])
-                    progress_cb("brightdata_completed", {"count": debug_count})
+            search_results, brightdata_debug = self.run_brightdata_stage(
+                search_results,
+                max_profiles=len(search_results),
+                progress_cb=progress_cb,
+            )
+            debug.update(brightdata_debug)
 
         return search_results, debug
+
+    def run_brightdata_stage(
+        self,
+        profiles: List[Union[SearchResult, Dict[str, Any]]],
+        *,
+        max_profiles: Optional[int] = None,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> Tuple[List[SearchResult], Dict[str, Any]]:
+        search_results = self._prepare_results(profiles, max_profiles)
+        debug: Dict[str, Any] = {"brightdata_results": []}
+
+        if not search_results:
+            return search_results, debug
+
+        if progress_cb:
+            progress_cb("brightdata_started", {"count": len(search_results)})
+        try:
+            debug["brightdata_results"] = self._refresh_profiles_with_brightdata(search_results)
+        except Exception as exc:  # pylint: disable=broad-except
+            debug["brightdata_error"] = str(exc)
+            if progress_cb:
+                progress_cb("brightdata_completed", {"count": 0, "error": str(exc)})
+        else:
+            if progress_cb:
+                progress_cb(
+                    "brightdata_completed",
+                    {"count": len(debug["brightdata_results"])},
+                )
+        return search_results, debug
+
+    def run_profile_fit_stage(
+        self,
+        profiles: List[Union[SearchResult, Dict[str, Any]]],
+        *,
+        business_fit_query: str,
+        max_profiles: Optional[int] = None,
+        concurrency: int = 64,
+        max_posts: int = 6,
+        model: str = "gpt-5-mini",
+        verbosity: str = "medium",
+        use_brightdata: bool = False,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> Tuple[List[SearchResult], Dict[str, Any]]:
+        if not business_fit_query:
+            raise ValueError("business_fit_query must be provided for profile fit stage")
+
+        search_results = self._prepare_results(profiles, max_profiles)
+        if not search_results:
+            return search_results, {"brightdata_results": [], "profile_fit": []}
+
+        fitted_results, debug = self._apply_profile_fit(
+            search_results,
+            business_fit_query=business_fit_query,
+            limit=len(search_results),
+            concurrency=concurrency,
+            max_posts=max_posts,
+            model=model,
+            verbosity=verbosity,
+            use_brightdata=use_brightdata,
+            progress_cb=progress_cb,
+        )
+        return fitted_results, debug
 
     def _apply_profile_fit(
         self,

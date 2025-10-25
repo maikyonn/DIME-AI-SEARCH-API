@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from datetime import datetime, timezone
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -63,7 +65,7 @@ app.add_middleware(
 )
 
 # Include API routes
-app.include_router(api_router, prefix="/api/v1")
+app.include_router(api_router, prefix=settings.API_V1_PREFIX)
 
 
 @app.get("/", tags=["Health"])
@@ -81,11 +83,13 @@ async def root():
 async def health_check():
     """Health check endpoint"""
     search_engine = get_search_engine()
-    
+
+    database_available = search_engine is not None
+
     return {
-        "status": "healthy",
-        "database_available": search_engine is not None,
-        "timestamp": "2024-01-01T00:00:00Z"
+        "status": "healthy" if database_available else "degraded",
+        "database_available": database_available,
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 
@@ -108,7 +112,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=8000,
+        port=settings.PORT,
         reload=True,
         log_level="info"
     )

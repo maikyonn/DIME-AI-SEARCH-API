@@ -1,161 +1,116 @@
-"""BrightData client helper for refreshing Instagram profile snapshots."""
+"""BrightData client that proxies through the DIME-AI-BD service."""
 from __future__ import annotations
 
-import os
 import time
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 
-
-@dataclass
-class BrightDataConfig:
-    api_key: str
-    dataset_id: str
-    poll_interval: int = 30
+from app.config import settings
 
 
 class BrightDataClient:
-    """Wrapper around the BrightData dataset API."""
+    """Wrapper around the DIME-AI-BD HTTP API for BrightData snapshots."""
 
-    BASE_URL = "https://api.brightdata.com/datasets/v3"
+    def __init__(self) -> None:
+        base_url = (settings.BRIGHTDATA_SERVICE_URL or "").rstrip("/")
+        if not base_url:
+            raise RuntimeError("BRIGHTDATA_SERVICE_URL must be configured to use BrightData features")
 
-    def __init__(self, config: Optional[BrightDataConfig] = None) -> None:
-        if config is not None:
-            api_key = config.api_key
-            dataset_id = config.dataset_id
-            poll_interval = config.poll_interval
-        else:
-            from app.config import settings  # local import to avoid circulars
-            api_key = settings.BRIGHTDATA_API_KEY or os.getenv("BRIGHTDATA_API_KEY")
-            dataset_id = settings.BRIGHTDATA_DATASET_ID or os.getenv("BRIGHTDATA_DATASET_ID")
-            poll_interval = settings.BRIGHTDATA_POLL_INTERVAL or int(os.getenv("BRIGHTDATA_POLL_INTERVAL", "30"))
-
-        if not api_key or not dataset_id:
-            raise RuntimeError(
-                "BrightData configuration missing. Set BRIGHTDATA_API_KEY and BRIGHTDATA_DATASET_ID."
-            )
-
-        self.config = BrightDataConfig(api_key=api_key, dataset_id=dataset_id, poll_interval=poll_interval)
-        self.base_url = settings.BRIGHTDATA_BASE_URL or os.getenv("BRIGHTDATA_BASE_URL", self.BASE_URL)
-        self.headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
-            "Content-Type": "application/json",
-        }
-
-    def _trigger_job(self, url_objects: List[Dict[str, str]]) -> Optional[str]:
-        payload = url_objects
-        response = requests.post(
-            f"{self.base_url}/trigger",
-            headers=self.headers,
-            params={"dataset_id": self.config.dataset_id, "include_errors": "true"},
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("snapshot_id")
-
-    def _wait_for_ready(self, snapshot_id: str) -> None:
-        while True:
-            response = requests.get(
-                f"{self.base_url}/progress/{snapshot_id}",
-                headers=self.headers,
-                timeout=30,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            status = payload.get("status")
-            if status == "ready":
-                return
-            if status == "failed":
-                raise RuntimeError(f"BrightData snapshot {snapshot_id} failed")
-            time.sleep(self.config.poll_interval)
-
-    def _download_csv(self, snapshot_id: str) -> pd.DataFrame:
-        params = {"format": "csv"}
-        response = requests.get(
-            f"{self.base_url}/snapshot/{snapshot_id}",
-            headers=self.headers,
-            params=params,
-            timeout=60,
-        )
-        response.raise_for_status()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"brightdata_snapshot_{snapshot_id}_{timestamp}.csv"
-        with open(filename, "wb") as file_handle:
-            file_handle.write(response.content)
-        return pd.read_csv(filename)
+        self.base_url = base_url
+        self.poll_interval = max(1, settings.BRIGHTDATA_JOB_POLL_INTERVAL or 5)
+        self.job_timeout = settings.BRIGHTDATA_JOB_TIMEOUT or 600
+        self.session = requests.Session()
 
     def fetch_profiles(self, profile_urls: Iterable[str]) -> pd.DataFrame:
-        """Trigger a BrightData job for the given profile URLs and return the result dataframe."""
-        url_objects = self._prepare_urls(profile_urls)
-        if not url_objects:
-            raise ValueError("No profile URLs provided to BrightData")
+        usernames = self._extract_usernames(profile_urls)
+        if not usernames:
+            raise ValueError("No profile URLs provided to BrightData service")
 
-        try:
-            snapshot_id = self._trigger_job(url_objects)
-        except requests.HTTPError as exc:
-            detail = exc.response.text if exc.response is not None else str(exc)
-            raise RuntimeError(f"BrightData trigger failed: {detail}") from exc
-        if not snapshot_id:
-            raise RuntimeError("Failed to trigger BrightData snapshot")
+        payload = {"usernames": usernames, "update_database": False}
+        response = self.session.post(f"{self.base_url}/refresh", json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        job_id = data.get("job_id")
+        if not job_id:
+            result = data.get("result")
+            if result:
+                return self._records_to_dataframe(result.get("records", []))
+            raise RuntimeError("BrightData service did not return job_id")
 
-        self._wait_for_ready(snapshot_id)
-        return self._download_csv(snapshot_id)
+        result_payload = self._wait_for_job(job_id)
+        records = result_payload.get("records", [])
+        return self._records_to_dataframe(records)
 
-    def _prepare_urls(self, profile_urls: Iterable[str]) -> List[Dict[str, str]]:
-        cleaned: List[Dict[str, str]] = []
-        seen: set[str] = set()
+    def _wait_for_job(self, job_id: str) -> Dict[str, object]:
+        deadline = time.monotonic() + self.job_timeout
+        last_status: Optional[str] = None
+        while time.monotonic() < deadline:
+            response = self.session.get(f"{self.base_url}/refresh/job/{job_id}", timeout=30)
+            if response.status_code == 404:
+                raise RuntimeError(f"BrightData job '{job_id}' not found")
+            response.raise_for_status()
+            payload = response.json().get("job", {})
+            status = payload.get("status")
+            last_status = status or last_status
+            if status == "finished":
+                return payload.get("result", {})
+            if status == "failed":
+                raise RuntimeError(payload.get("error") or f"BrightData job '{job_id}' failed")
+            time.sleep(self.poll_interval)
 
+        raise RuntimeError(
+            f"Timed out after {self.job_timeout}s waiting for BrightData job '{job_id}' (last status: {last_status})"
+        )
+
+    def _extract_usernames(self, profile_urls: Iterable[str]) -> List[str]:
+        usernames: List[str] = []
         for raw in profile_urls:
-            if not raw:
+            platform, handle = self._parse_social_url(raw)
+            if not handle:
                 continue
-            url = raw.strip()
-            if not url:
-                continue
-
-            canonical = self._canonicalize_url(url)
-            if not canonical:
-                continue
-            if canonical.lower() in seen:
-                continue
-
-            seen.add(canonical.lower())
-            cleaned.append({"url": canonical})
-
-        return cleaned
+            if platform == "instagram":
+                usernames.append(handle)
+        return usernames
 
     @staticmethod
-    def _canonicalize_url(url: str) -> Optional[str]:
+    def _parse_social_url(url: str) -> Tuple[str, Optional[str]]:
+        if not url:
+            return "", None
+
         try:
-            parsed = urlparse(url.strip())
+            parsed = urlparse(url)
         except Exception:
-            return None
+            return "", None
 
-        if not parsed.netloc:
-            return None
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").strip("/")
+        if "instagram.com" in host and path:
+            handle = path.split("/")[0].lstrip("@")
+            return "instagram", handle
+        if "tiktok.com" in host and path:
+            if path.startswith("@"):
+                handle = path.lstrip("@")
+            elif path.startswith("/@"):
+                handle = path[2:]
+            else:
+                handle = path
+            return "tiktok", handle
+        return "", None
 
-        scheme = parsed.scheme or 'https'
-        host = parsed.netloc.lower()
-        path = parsed.path.rstrip('/')
-
-        if 'instagram.com' in host:
-            if not path:
-                return None
-            return f"{scheme}://{host}{path}"
-
-        # Unsupported host
-        return None
+    @staticmethod
+    def _records_to_dataframe(records: List[Dict[str, object]]) -> pd.DataFrame:
+        if not records:
+            return pd.DataFrame()
+        return pd.DataFrame.from_records(records)
 
     @staticmethod
     def dataframe_to_profile_map(df: pd.DataFrame) -> Dict[str, Dict[str, Optional[str]]]:
-        """Convert BrightData dataframe into a mapping keyed by profile URL or account."""
         profile_map: Dict[str, Dict[str, Optional[str]]] = {}
+        if df.empty:
+            return profile_map
         for _, row in df.iterrows():
             profile_url = row.get("profile_url") or row.get("url")
             account = row.get("account")

@@ -13,10 +13,12 @@ fi
 echo "📦 Activating virtual environment..."
 source venv/bin/activate
 
-# Install dependencies if requirements have changed
-if [ requirements.txt -nt venv/pyvenv.cfg ]; then
+# Install dependencies if requirements have changed or first run
+DEPS_SENTINEL="venv/.requirements-installed"
+if [ ! -f "${DEPS_SENTINEL}" ] || [ requirements.txt -nt "${DEPS_SENTINEL}" ]; then
     echo "📥 Installing/updating dependencies..."
     pip install -r requirements.txt
+    touch "${DEPS_SENTINEL}"
 fi
 
 # Check if .env file exists
@@ -27,23 +29,56 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
-# Resolve combined LanceDB vector path relative to this repo
-PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
-VDB_PATH="${PROJECT_ROOT}/../DIME-AI-DB/data/combined/influencers_vectordb"
+# Load environment variables (including PORT) from .env
+set -a
+source .env
+set +a
 
-if [ -d "$VDB_PATH" ]; then
-    export DB_PATH="$VDB_PATH"
-    echo "📂 Using combined vector database at: $DB_PATH"
+# Resolve LanceDB location (prefers DIME-AI-DB/data/lancedb)
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+WORKSPACE_ROOT="$(dirname "$PROJECT_ROOT")"
+CANDIDATES=()
+
+if [ -n "${DIME_AI_DB_ROOT}" ]; then
+    CANDIDATES+=("${DIME_AI_DB_ROOT}")
+fi
+
+CANDIDATES+=(
+    "${WORKSPACE_ROOT}/DIME-AI-DB"
+    "${PROJECT_ROOT}/DIME-AI-DB"
+)
+
+function pick_db_path() {
+    for base in "${CANDIDATES[@]}"; do
+        if [ -d "${base}/data/lancedb" ]; then
+            echo "${base}/data/lancedb"
+            return 0
+        fi
+    done
+    for base in "${CANDIDATES[@]}"; do
+        if [ -d "${base}/influencers_vectordb" ]; then
+            echo "${base}/influencers_vectordb"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if resolved_path="$(pick_db_path)"; then
+    export DB_PATH="${DB_PATH:-$resolved_path}"
+    echo "📂 Using LanceDB at: ${DB_PATH}"
 else
-    echo "⚠️  Combined vector database not found at $VDB_PATH"
-    echo "   Falling back to path from configuration (.env or defaults)."
+    echo "⚠️  Could not auto-detect LanceDB directory."
+    echo "   Set DIME_AI_DB_ROOT or DB_PATH to point at DIME-AI-DB/data/lancedb."
 fi
 
 # Start the FastAPI server
 echo "🌐 Starting FastAPI server..."
-echo "📡 API will be available at: http://localhost:8000"
-echo "📖 API documentation at: http://localhost:8000/docs"
-echo "📚 Alternative docs at: http://localhost:8000/redoc"
+APP_PORT="${PORT:-7001}"
+
+echo "📡 API will be available at: http://localhost:${APP_PORT}"
+echo "📖 API documentation at: http://localhost:${APP_PORT}/docs"
+echo "📚 Alternative docs at: http://localhost:${APP_PORT}/redoc"
 echo ""
 
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app.main:app --host 0.0.0.0 --port "${APP_PORT}" --reload

@@ -3,12 +3,14 @@ import json
 import logging
 import threading
 from queue import SimpleQueue
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.dependencies import get_search_engine
+from app.services import SearchPipelineService
+from app.core.search_engine import SearchResult
 from app.models.search import (
     SearchRequest,
     SimilarSearchRequest,
@@ -17,6 +19,12 @@ from app.models.search import (
     SearchResponse,
     EvaluationResponse,
     UsernameSearchResponse,
+    SearchPipelineRequest,
+    SearchPipelineResponse,
+    BrightDataStageRequest,
+    BrightDataStageResponse,
+    ProfileFitStageRequest,
+    ProfileFitStageResponse,
 )
 
 router = APIRouter()
@@ -112,6 +120,22 @@ def result_to_dict(result) -> Dict[str, Any]:
         "fit_prompt": getattr(result, "fit_prompt", None),
         "fit_raw_response": getattr(result, "fit_raw_response", None),
     }
+
+
+def _serialize_stage_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    if not data:
+        return {}
+
+    serialized: Dict[str, Any] = {}
+    for key, value in data.items():
+        if key == "results" and isinstance(value, list):
+            serialized[key] = [
+                result_to_dict(item) if isinstance(item, SearchResult) else item
+                for item in value
+            ]
+        else:
+            serialized[key] = value
+    return serialized
 
 
 @router.get("/username/{username}", response_model=UsernameSearchResponse)
@@ -236,6 +260,106 @@ async def category_search(request: CategorySearchRequest, search_engine=Depends(
     )
 
 
+@router.post("/pipeline", response_model=SearchPipelineResponse)
+async def search_pipeline(request: SearchPipelineRequest, search_engine=Depends(get_search_engine)):
+    logger.info(
+        "Search pipeline | method=%s limit=%s brightdata=%s llm=%s",
+        request.search.method,
+        request.search.limit,
+        request.run_brightdata,
+        request.run_llm,
+    )
+
+    pipeline = SearchPipelineService(search_engine)
+    stage_events: List[Dict[str, Any]] = []
+
+    def capture(stage: str, data: Dict[str, Any]) -> None:
+        stage_events.append({"stage": stage, "data": _serialize_stage_payload(data)})
+
+    try:
+        results, debug = pipeline.run_pipeline(request, progress_cb=capture)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Pipeline execution failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Search pipeline failed") from exc
+
+    payload = [result_to_dict(result) for result in results]
+    final_data = {
+        "results": payload,
+        "brightdata_results": debug.get("brightdata_results", []),
+        "profile_fit": debug.get("profile_fit", []),
+        "count": len(payload),
+    }
+    stage_events.append({"stage": "completed", "data": final_data})
+
+    return SearchPipelineResponse(
+        success=True,
+        results=payload,
+        brightdata_results=debug.get("brightdata_results", []),
+        profile_fit=debug.get("profile_fit", []),
+        stages=stage_events,
+        count=len(payload),
+    )
+
+
+@router.post("/pipeline/stream")
+async def search_pipeline_stream(request: SearchPipelineRequest, search_engine=Depends(get_search_engine)):
+    logger.info(
+        "Search pipeline stream | method=%s limit=%s brightdata=%s llm=%s",
+        request.search.method,
+        request.search.limit,
+        request.run_brightdata,
+        request.run_llm,
+    )
+
+    pipeline = SearchPipelineService(search_engine)
+
+    def sse_event(stage: str, data: Dict[str, Any]) -> str:
+        return f"data: {json.dumps({'stage': stage, 'data': data})}\n\n"
+
+    def event_stream():
+        queue: "SimpleQueue[Optional[Dict[str, Any]]]" = SimpleQueue()
+
+        def progress(stage: str, data: Dict[str, Any]) -> None:
+            queue.put({"stage": stage, "data": _serialize_stage_payload(data)})
+
+        def worker() -> None:
+            try:
+                results, debug = pipeline.run_pipeline(request, progress_cb=progress)
+                payload = [result_to_dict(result) for result in results]
+                queue.put(
+                    {
+                        "stage": "completed",
+                        "data": {
+                            "results": payload,
+                            "brightdata_results": debug.get("brightdata_results", []),
+                            "profile_fit": debug.get("profile_fit", []),
+                            "count": len(payload),
+                        },
+                    }
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("Streaming pipeline failed: %s", exc)
+                queue.put({"stage": "error", "data": {"message": str(exc)}})
+            finally:
+                queue.put(None)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            item = queue.get()
+            if item is None:
+                break
+            yield sse_event(item["stage"], item["data"])
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
 @router.post("/evaluate", response_model=EvaluationResponse)
 async def evaluate_profiles(request: EvaluationRequest, search_engine=Depends(get_search_engine)):
     logger.info(
@@ -265,6 +389,66 @@ async def evaluate_profiles(request: EvaluationRequest, search_engine=Depends(ge
 
     payload = [result_to_dict(result) for result in results]
     return EvaluationResponse(
+        success=True,
+        results=payload,
+        brightdata_results=debug.get("brightdata_results", []),
+        profile_fit=debug.get("profile_fit", []),
+        count=len(payload),
+    )
+
+
+@router.post("/evaluate/brightdata", response_model=BrightDataStageResponse)
+async def evaluate_brightdata_stage(request: BrightDataStageRequest, search_engine=Depends(get_search_engine)):
+    logger.info("BrightData stage | count=%s", len(request.profiles))
+
+    try:
+        results, debug = search_engine.run_brightdata_stage(
+            request.profiles,
+            max_profiles=request.max_profiles,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("BrightData stage failed: %s", exc)
+        raise HTTPException(status_code=500, detail="BrightData stage failed") from exc
+
+    payload = [result_to_dict(result) for result in results]
+    return BrightDataStageResponse(
+        success=True,
+        results=payload,
+        brightdata_results=debug.get("brightdata_results", []),
+        count=len(payload),
+    )
+
+
+@router.post("/evaluate/llm", response_model=ProfileFitStageResponse)
+async def evaluate_llm_stage(request: ProfileFitStageRequest, search_engine=Depends(get_search_engine)):
+    logger.info(
+        "LLM stage | count=%s model=%s use_brightdata=%s",
+        len(request.profiles),
+        request.model,
+        request.use_brightdata,
+    )
+
+    try:
+        results, debug = search_engine.run_profile_fit_stage(
+            request.profiles,
+            business_fit_query=request.business_fit_query,
+            max_profiles=request.max_profiles,
+            concurrency=request.concurrency,
+            max_posts=request.max_posts,
+            model=request.model,
+            verbosity=request.verbosity,
+            use_brightdata=request.use_brightdata,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("LLM stage failed: %s", exc)
+        raise HTTPException(status_code=500, detail="LLM stage failed") from exc
+
+    payload = [result_to_dict(result) for result in results]
+    return ProfileFitStageResponse(
         success=True,
         results=payload,
         brightdata_results=debug.get("brightdata_results", []),

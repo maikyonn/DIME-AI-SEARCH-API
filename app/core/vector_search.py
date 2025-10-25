@@ -2,35 +2,19 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 import lancedb
 import numpy as np
 import pandas as pd
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 
+from app.config import settings
 
-def _resolve_embed_device() -> Optional[str]:
-    device = os.environ.get("EMBED_DEVICE")
-    if device:
-        return device
-    try:
-        import torch
+LOGGER = logging.getLogger(__name__)
 
-        if torch.cuda.is_available():  # pragma: no branch
-            return "cuda"
-    except Exception:  # pragma: no cover - torch optional
-        return None
-    return None
-
-
-def _resolve_hf_token() -> Optional[str]:
-    return (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGINGFACE_TOKEN")
-        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        or os.environ.get("HUGGINGFACE_API_KEY")
-    )
+DEFAULT_DEEPINFRA_ENDPOINT = "https://api.deepinfra.com/v1/openai"
 
 
 def _format_literal(value: Any) -> str:
@@ -90,19 +74,39 @@ class VectorSearchEngine:
     ) -> None:
         self.db_path = db_path
         self.table_name = table_name
-        self.model_name = model_name or os.environ.get(
-            "EMBED_MODEL", "google/embeddinggemma-300m"
-        )
+        self.model_name = model_name or settings.EMBED_MODEL or os.environ.get("EMBED_MODEL", "google/embeddinggemma-300m")
 
         self.db: Optional[lancedb.db.DBConnection] = None
         self.table: Optional[lancedb.table.Table] = None
-        self._model: Optional[SentenceTransformer] = None
+        self.embedder: Optional["DeepInfraQueryEmbedder"] = None
 
         self._profiles_df: Optional[pd.DataFrame] = None
         self._profile_columns: Tuple[str, ...] = tuple()
 
         self.connect()
         self._ensure_profiles_loaded()
+        self._init_embedder()
+
+    def _init_embedder(self) -> None:
+        api_key = settings.DEEPINFRA_API_KEY or os.environ.get("DEEPINFRA_API_KEY")
+        endpoint = settings.DEEPINFRA_ENDPOINT or os.environ.get("DEEPINFRA_ENDPOINT", DEFAULT_DEEPINFRA_ENDPOINT)
+
+        if not api_key:
+            LOGGER.warning(
+                "DeepInfra API key not configured; semantic and hybrid searches will be unavailable."
+            )
+            self.embedder = None
+            return
+
+        try:
+            self.embedder = DeepInfraQueryEmbedder(
+                model_name=self.model_name,
+                api_key=api_key,
+                endpoint=endpoint or DEFAULT_DEEPINFRA_ENDPOINT,
+            )
+        except Exception as exc:  # pragma: no cover - network errors
+            LOGGER.warning("Failed to initialise DeepInfra embedder: %s", exc)
+            self.embedder = None
 
     # ---------------------------------------------------------------------
     # Connection + caching helpers
@@ -197,6 +201,11 @@ class VectorSearchEngine:
         vector = None
         query_text = (params.query or "").strip()
         if include_semantic and query_text:
+            if self.embedder is None:
+                raise ValueError(
+                    "Semantic search requires DeepInfra embeddings. "
+                    "Set DEEPINFRA_API_KEY (and optionally DEEPINFRA_ENDPOINT) to enable semantic or hybrid modes."
+                )
             vector = self._encode_query(query_text)
 
         return self._run_search(
@@ -616,40 +625,48 @@ class VectorSearchEngine:
         return None
 
     def _encode_query(self, query: str) -> np.ndarray:
-        model = self._load_model()
-        vector = model.encode((query or "").strip(), convert_to_numpy=True)
-        vector = vector.astype(np.float32, copy=False)
+        if self.embedder is None:
+            raise RuntimeError("DeepInfra embedder not initialised")
+        return self.embedder.embed(query)
+
+
+class DeepInfraQueryEmbedder:
+    """Lightweight client for DeepInfra's OpenAI-compatible embedding endpoint."""
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        api_key: str,
+        endpoint: Optional[str] = None,
+    ) -> None:
+        if not api_key:
+            raise ValueError("DeepInfra API key is required for semantic search.")
+
+        self.model_name = model_name
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=(endpoint or DEFAULT_DEEPINFRA_ENDPOINT).rstrip("/"),
+        )
+
+    def embed(self, text: str) -> np.ndarray:
+        payload = (text or "").strip()
+        if not payload:
+            raise ValueError("Cannot embed an empty query.")
+
+        response = self.client.embeddings.create(
+            model=self.model_name,
+            input=[payload],
+            encoding_format="float",
+        )
+
+        items = response.data or []
+        if not items:
+            raise RuntimeError("DeepInfra embedding response contained no vectors.")
+
+        vector = np.asarray(items[0].embedding, dtype=np.float32)
         norm = np.linalg.norm(vector) or 1.0
         return vector / norm
-
-    def _load_model(self) -> SentenceTransformer:
-        if self._model is not None:
-            return self._model
-
-        kwargs: Dict[str, Any] = {}
-        token = _resolve_hf_token()
-        if token:
-            try:
-                kwargs["token"] = token
-            except TypeError:
-                kwargs.pop("token", None)
-                kwargs["use_auth_token"] = token
-
-        device = _resolve_embed_device()
-        if device:
-            kwargs["device"] = device
-
-        try:
-            self._model = SentenceTransformer(self.model_name, **kwargs)
-        except TypeError:
-            # Retry using legacy auth argument name if necessary
-            if "token" in kwargs:
-                token_value = kwargs.pop("token")
-                kwargs["use_auth_token"] = token_value
-                self._model = SentenceTransformer(self.model_name, **kwargs)
-            else:
-                raise
-        return self._model
 
 
 __all__ = ["VectorSearchEngine", "SearchWeights", "SearchParams"]
